@@ -1,0 +1,66 @@
+name: CI
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        ruby: ["3.1", "3.2", "3.3", "3.4"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ matrix.ruby }}
+          bundler-cache: true
+      - run: bundle exec rake compile
+      - run: bundle exec rake test
+
+  memory:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+          bundler-cache: true
+      - run: sudo apt-get update && sudo apt-get install -y valgrind
+      - run: bundle exec rake compile
+      - name: GC.stress
+        run: RUBY_GC_STRESS=1 bundle exec ruby -Ilib -Itest test/embedding_test.rb
+      - name: build memory fixture
+        run: |
+          ruby tools/make_fixture_model.rb
+          ruby -Ilib -e 'require "static_embeddings"; Dir.mkdir("tmp") unless Dir.exist?("tmp"); StaticEmbeddings.convert("test/fixtures/tiny-wordpiece", output_path: "tmp/test-tiny.semb", model_id: "fixture/tiny-wordpiece")'
+      - name: build memory smoke
+        run: |
+          cc -O2 -std=c99 -Wall -Wextra -Iext/static_embeddings \
+            tools/memory_smoke.c \
+            ext/static_embeddings/se_format.c \
+            ext/static_embeddings/se_unicode.c \
+            ext/static_embeddings/se_tokenizer.c \
+            ext/static_embeddings/se_embed.c \
+            -lm -o tmp/memory_smoke
+      - name: valgrind
+        run: |
+          valgrind --error-exitcode=1 \
+            --leak-check=full \
+            --show-leak-kinds=definite \
+            --errors-for-leak-kinds=definite \
+            --undef-value-errors=no \
+            ./tmp/memory_smoke tmp/test-tiny.semb
+
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+          bundler-cache: true
+      - run: bundle exec rake compile
+      - run: bundle exec rake demo_model
+      - run: ruby tools/benchmark.rb

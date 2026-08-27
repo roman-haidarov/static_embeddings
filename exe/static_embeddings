@@ -1,0 +1,6 @@
+#!/usr/bin/env ruby
+
+require "static_embeddings"
+require "static_embeddings/cli"
+
+exit(StaticEmbeddings::CLI.run(ARGV) || 0)

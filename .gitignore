@@ -1,0 +1,13 @@
+*.bundle
+*.so
+*.o
+*.log
+/tmp/
+/pkg/
+/.bundle/
+/lib/static_embeddings/static_embeddings.*
+/test/fixtures/tiny-wordpiece/
+.DS_Store
+Gemfile.lock
+
+samples/results/*
