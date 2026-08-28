@@ -91,7 +91,7 @@ class EmbeddingTest < Minitest::Test
     matrix = @model.embed_batch(corpus, format: :f16)
     query = @model.embed("hello world", format: :f16)
 
-    results = StaticEmbeddings.cosine_top_k(query, matrix, 2, format: :f16)
+    results = StaticEmbeddings.cosine_top_k(query, matrix, 2, dim: @model.dim, format: :f16)
     assert_equal 2, results.length
     assert_equal 0, results.first[0]
     assert_in_delta 1.0, results.first[1], 1e-3
@@ -159,7 +159,7 @@ class EmbeddingTest < Minitest::Test
     matrix = @model.embed_batch(corpus)
     query = @model.embed("hello world")
 
-    results = StaticEmbeddings.cosine_top_k(query, matrix, 2)
+    results = StaticEmbeddings.cosine_top_k(query, matrix, 2, dim: @model.dim)
     assert_equal 2, results.length
     assert_equal 0, results.first[0]
     assert_in_delta 1.0, results.first[1], 1e-5
@@ -168,8 +168,8 @@ class EmbeddingTest < Minitest::Test
 
   def test_top_k_empty_matrix_returns_empty_array
     query = [1.0, 0.0].pack("e*")
-    assert_equal [], StaticEmbeddings.dot_top_k(query, "".b, 10)
-    assert_equal [], StaticEmbeddings.cosine_top_k(query, "".b, 10)
+    assert_equal [], StaticEmbeddings.dot_top_k(query, "".b, 10, dim: 2)
+    assert_equal [], StaticEmbeddings.cosine_top_k(query, "".b, 10, dim: 2)
   end
 
   def test_top_k_accepts_unaligned_matrix_string
@@ -177,13 +177,13 @@ class EmbeddingTest < Minitest::Test
     raw = "x".b + [1.0, 0.0, 0.0, 1.0].pack("e*")
     matrix = raw.byteslice(1, raw.bytesize - 1)
 
-    assert_equal [[0, 1.0], [1, 0.0]], StaticEmbeddings.dot_top_k(query, matrix, 2)
+    assert_equal [[0, 1.0], [1, 0.0]], StaticEmbeddings.dot_top_k(query, matrix, 2, dim: 2)
   end
 
   def test_dot_top_k_keeps_scores_below_minus_two
     query = [-1.0].pack("e")
     matrix = [3.0, 2.0, 1.0].pack("e*")
-    results = StaticEmbeddings.dot_top_k(query, matrix, 3)
+    results = StaticEmbeddings.dot_top_k(query, matrix, 3, dim: 1)
 
     assert_equal [[2, -1.0], [1, -2.0], [0, -3.0]], results
   end
@@ -191,13 +191,13 @@ class EmbeddingTest < Minitest::Test
   def test_dot_top_k_is_a_raw_dot_product
     query = [3.0, 4.0].pack("e*")
     matrix = [3.0, 4.0].pack("e*")
-    assert_in_delta 25.0, StaticEmbeddings.dot_top_k(query, matrix, 1).first[1], 1e-5
+    assert_in_delta 25.0, StaticEmbeddings.dot_top_k(query, matrix, 1, dim: 2).first[1], 1e-5
   end
 
   def test_cosine_top_k_normalizes_unnormalized_input
     query = [3.0, 4.0].pack("e*")
     matrix = [30.0, 40.0, -4.0, 3.0].pack("e*")
-    results = StaticEmbeddings.cosine_top_k(query, matrix, 2)
+    results = StaticEmbeddings.cosine_top_k(query, matrix, 2, dim: 2)
 
     assert_equal 0, results.first[0]
     assert_in_delta 1.0, results.first[1], 1e-6
@@ -207,7 +207,7 @@ class EmbeddingTest < Minitest::Test
   def test_cosine_top_k_treats_a_zero_row_as_zero_similarity
     query = [1.0, 0.0].pack("e*")
     matrix = [0.0, 0.0, 1.0, 0.0].pack("e*")
-    results = StaticEmbeddings.cosine_top_k(query, matrix, 2)
+    results = StaticEmbeddings.cosine_top_k(query, matrix, 2, dim: 2)
 
     assert_equal 1, results.first[0]
     assert_in_delta 1.0, results.first[1], 1e-6
@@ -217,14 +217,14 @@ class EmbeddingTest < Minitest::Test
   def test_cosine_top_k_rejects_a_zero_query
     query = [0.0, 0.0].pack("e*")
     matrix = [1.0, 0.0].pack("e*")
-    assert_raises(ArgumentError) { StaticEmbeddings.cosine_top_k(query, matrix, 1) }
+    assert_raises(ArgumentError) { StaticEmbeddings.cosine_top_k(query, matrix, 1, dim: 2) }
   end
 
   def test_top_k_is_not_poisoned_by_nan_rows
     nan = [Float::NAN].pack("e")
     query = [1.0].pack("e")
     matrix = ([2.0].pack("e") + nan + [5.0].pack("e") + [1.0].pack("e"))
-    results = StaticEmbeddings.dot_top_k(query, matrix, 3)
+    results = StaticEmbeddings.dot_top_k(query, matrix, 3, dim: 1)
 
     assert_equal [2, 0, 3], results.map(&:first)
     refute results.any? { |(_, score)| score.nan? }, "a NaN row leaked into the top-k"
@@ -260,7 +260,6 @@ class EmbeddingTest < Minitest::Test
   def test_embed_token_ids_rejects_out_of_range_ids
     assert_raises(ArgumentError) { @model.embed_token_ids([@model.vocab_size]) }
   end
-
 
   def test_embed_token_ids_rejects_non_integer_ids
     assert_raises(TypeError) { @model.embed_token_ids([1, "x", 3]) }

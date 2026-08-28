@@ -14,7 +14,7 @@ k = StaticEmbeddingsSample.env_int("K", 10)
 bytes_per_text = StaticEmbeddingsSample.env_int("BYTES_PER_TEXT", 96)
 texts = StaticEmbeddingsSample.corpus(mode, rows, bytes_per_text)
 query = model.embed("postgres ruby static embeddings vector search hot path", format: format)
-matrix = model.embed_batch(texts, format: format)
+matrix = model.embed_batch(texts, format: format).freeze # frozen: required for lock-free concurrent scans
 StaticEmbeddingsSample.embedding_blob!(query, model, 1, "query", format: format)
 StaticEmbeddingsSample.embedding_blob!(matrix, model, rows, "matrix", format: format)
 native_grep = "StaticEmbeddings|static_embeddings|top_k_impl|topk_execute|dot_product_unrolled|row_sum_squares"
@@ -22,14 +22,14 @@ native_grep = "StaticEmbeddings|static_embeddings|top_k_impl|topk_execute|dot_pr
 top_k = metric == "cosine" ? StaticEmbeddings.method(:cosine_top_k) : StaticEmbeddings.method(:dot_top_k)
 
 StaticEmbeddingsSample.preheat(preheat_iterations) do
-  result = top_k.call(query, matrix, k, format: format)
+  result = top_k.call(query, matrix, k, dim: model.dim, format: format)
   raise "preheat: empty result" if result.empty?
 end
 
 StaticEmbeddingsSample.print_header(
   sample_name: sample_name,
   model: model,
-  call: "StaticEmbeddings.#{metric}_top_k(query, matrix, #{k}, format: :#{StaticEmbeddingsSample.format_label(format)})",
+  call: "StaticEmbeddings.#{metric}_top_k(query, matrix, #{k}, dim: #{model.dim}, format: :#{StaticEmbeddingsSample.format_label(format)})",
   duration: duration,
   sleep_before_hot_loop: sleep_before_hot_loop,
   preheat_iterations: preheat_iterations,
@@ -52,7 +52,7 @@ StaticEmbeddingsSample.print_header(
 
 sleep sleep_before_hot_loop
 count, elapsed, last, gc_delta = StaticEmbeddingsSample.run_measured(duration) do
-  top_k.call(query, matrix, k, format: format)
+  top_k.call(query, matrix, k, dim: model.dim, format: format)
 end
 raise "last_hot_loop: empty result" if last.nil? || last.empty?
 

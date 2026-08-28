@@ -18,9 +18,20 @@
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
 #include <arm_neon.h>
 #define SE_HAVE_NEON 1
+#if defined(__aarch64__)
+#define SE_HAVE_NEON_FP16 1
+#endif
 #elif defined(__SSE__)
 #include <xmmintrin.h>
 #define SE_HAVE_SSE 1
+#endif
+
+#if defined(__x86_64__) || defined(__i386__)
+#if defined(__GNUC__) || defined(__clang__)
+#include <cpuid.h>
+#include <immintrin.h>
+#define SE_HAVE_X86_F16C_TARGET 1
+#endif
 #endif
 
 #include "se_internal.h"
@@ -42,6 +53,22 @@
 #define SE_SIZE_MAX                  ((size_t)-1)
 
 typedef enum { SE_VECTOR_FORMAT_F32 = 1, SE_VECTOR_FORMAT_F16 = 2 } se_vector_format_t;
+
+typedef enum {
+    SE_F16_BACKEND_LUT = 0,
+    SE_F16_BACKEND_NEON_FP16 = 1,
+    SE_F16_BACKEND_F16C = 2
+} se_f16_backend_t;
+
+static se_f16_backend_t se_f16_backend = SE_F16_BACKEND_LUT;
+
+#if !defined(SE_HAVE_NEON_FP16)
+#define SE_NEED_F16_LUT 1
+/* 256 KB of BSS, and only for builds that can fall back to it. It is populated
+ * lazily by select_f16_backend, so an x86 machine with F16C never touches these
+ * pages either. AArch64 does not compile the table at all. */
+static float se_f16_lut[65536];
+#endif
 
 static size_t vector_format_element_bytes(se_vector_format_t format) {
     return format == SE_VECTOR_FORMAT_F16 ? 2u : sizeof(float);
@@ -161,6 +188,42 @@ static void decode_f16_to_floats(float *dst, const uint8_t *src, size_t count) {
         dst[i] = f16_bits_to_float(read_u16le(src + i * 2));
 }
 
+#if defined(SE_NEED_F16_LUT)
+static void init_f16_lut(void) {
+    for (uint32_t i = 0; i <= 0xffffu; i++)
+        se_f16_lut[i] = f16_bits_to_float((uint16_t)i);
+}
+#endif
+
+#if defined(SE_HAVE_X86_F16C_TARGET)
+#ifndef bit_OSXSAVE
+#define bit_OSXSAVE (1u << 27)
+#endif
+#ifndef bit_AVX
+#define bit_AVX (1u << 28)
+#endif
+#ifndef bit_F16C
+#define bit_F16C (1u << 29)
+#endif
+
+static int detect_x86_f16c(void) {
+    unsigned int eax = 0, ebx = 0, ecx = 0, edx = 0;
+    if (!__get_cpuid(1, &eax, &ebx, &ecx, &edx))
+        return 0;
+    if ((ecx & bit_OSXSAVE) == 0 || (ecx & bit_AVX) == 0 || (ecx & bit_F16C) == 0)
+        return 0;
+
+    uint32_t xcr0_lo = 0, xcr0_hi = 0;
+#if defined(_MSC_VER)
+    return 0;
+#else
+    __asm__ volatile("xgetbv" : "=a"(xcr0_lo), "=d"(xcr0_hi) : "c"(0));
+    (void)xcr0_hi;
+    return (xcr0_lo & 0x6u) == 0x6u;
+#endif
+}
+#endif
+
 static int checked_add_size(size_t a, size_t b, size_t *out) {
     if (a > SE_SIZE_MAX - b)
         return 0;
@@ -201,6 +264,8 @@ static ID id_vector;
 static ID id_token_count;
 static ID id_unk_count;
 static ID id_truncated;
+static ID id_dim;
+static ID id_allow_unfrozen;
 
 RUBY_FUNC_EXPORTED void Init_static_embeddings(void);
 
@@ -333,7 +398,7 @@ static void batch_worker_run(batch_job_t *job, se_scratch_t *scratch) {
         size_t len = job->input.lengths[i];
         size_t row = job->out_index ? job->out_index[i] : i;
 
-        if (!se_scratch_reserve(scratch, len, dim)) {
+        if (!se_scratch_reserve(scratch, dim)) {
             se_error_t err;
             se_error_set(&err, SE_ERR_OOM, "out of memory while sizing scratch buffers");
             job_fail(job, err, i);
@@ -610,18 +675,13 @@ static size_t prefix_initial_target(uint32_t max_tokens) {
     return target;
 }
 
-static size_t prefix_boundary_len(VALUE text, size_t target) {
+static size_t prefix_boundary_len(const se_model_t *model, VALUE text, size_t target) {
     size_t full_len = (size_t)RSTRING_LEN(text);
     if (target >= full_len)
         return full_len;
 
     const uint8_t *ptr = (const uint8_t *)RSTRING_PTR(text);
-    size_t floor = target > SE_PREFIX_BACKSCAN_BYTES ? target - SE_PREFIX_BACKSCAN_BYTES : 0;
-    for (size_t i = target; i > floor; i--) {
-        if (se_is_ascii_boundary(ptr[i - 1]))
-            return i;
-    }
-    return 0;
+    return se_prefix_boundary_len(model, ptr, full_len, target, SE_PREFIX_BACKSCAN_BYTES);
 }
 
 static size_t grow_target(size_t target, size_t full_len) {
@@ -630,7 +690,8 @@ static size_t grow_target(size_t target, size_t full_len) {
     return target * 2;
 }
 
-static size_t resolve_copy_len(VALUE text, size_t *target, uint32_t max_tokens) {
+static size_t resolve_copy_len(const se_model_t *model, VALUE text, size_t *target,
+                               uint32_t max_tokens) {
     size_t full_len = (size_t)RSTRING_LEN(text);
     if (max_tokens == 0 || *target == 0 || *target >= full_len) {
         *target = full_len;
@@ -638,7 +699,7 @@ static size_t resolve_copy_len(VALUE text, size_t *target, uint32_t max_tokens) 
     }
 
     for (;;) {
-        size_t copy_len = prefix_boundary_len(text, *target);
+        size_t copy_len = prefix_boundary_len(model, text, *target);
         if (copy_len)
             return copy_len;
         if (*target >= full_len) {
@@ -650,20 +711,23 @@ static size_t resolve_copy_len(VALUE text, size_t *target, uint32_t max_tokens) 
 }
 
 typedef struct {
-    VALUE texts;
+    VALUE snapshot;
     int is_array;
 } text_source_t;
 
 static VALUE text_at(const text_source_t *src, size_t i) {
-    return src->is_array ? rb_ary_entry(src->texts, (long)i) : src->texts;
+    return RARRAY_AREF(src->snapshot, (long)i);
 }
 
-static void validate_texts(const text_source_t *src, size_t count) {
+static VALUE snapshot_texts(VALUE texts, int is_array, size_t count) {
+    VALUE snapshot = rb_ary_new_capa((long)count);
     for (size_t i = 0; i < count; i++) {
-        VALUE s = text_at(src, i);
+        VALUE s = is_array ? rb_ary_entry(texts, (long)i) : texts;
         Check_Type(s, T_STRING);
-        check_text_encoding_at(s, src->is_array ? (long)i : -1);
+        check_text_encoding_at(s, is_array ? (long)i : -1);
+        rb_ary_push(snapshot, s);
     }
+    return snapshot;
 }
 
 static int build_input_indexed(const text_source_t *src, const size_t *indices,
@@ -789,7 +853,7 @@ static void embed_run_free(embed_run_t *run) {
     memset(run, 0, sizeof(*run));
 }
 
-static VALUE embed_texts_internal(VALUE self, const text_source_t *src, size_t count,
+static VALUE embed_texts_internal(VALUE self, VALUE texts, int is_array, size_t count,
                                   VALUE max_tokens_opt, se_vector_format_t format,
                                   se_token_stats_t *stats_out) {
     model_wrapper_t *w = get_model(self);
@@ -797,7 +861,10 @@ static VALUE embed_texts_internal(VALUE self, const text_source_t *src, size_t c
     const uint32_t dim = model->meta.dim;
     const uint32_t max_tokens = resolve_max_tokens(model, max_tokens_opt);
 
-    validate_texts(src, count);
+    text_source_t source;
+    source.snapshot = snapshot_texts(texts, is_array, count);
+    source.is_array = is_array;
+    const text_source_t *src = &source;
 
     size_t floats;
     size_t out_bytes;
@@ -830,7 +897,7 @@ static VALUE embed_texts_internal(VALUE self, const text_source_t *src, size_t c
         for (size_t j = 0; j < npending; j++) {
             size_t i = run.pending[j];
             VALUE s = text_at(src, i);
-            run.copy_lens[j] = resolve_copy_len(s, &run.targets[i], max_tokens);
+            run.copy_lens[j] = resolve_copy_len(model, s, &run.targets[i], max_tokens);
         }
 
         batch_job_t job;
@@ -908,8 +975,8 @@ static VALUE embed_texts_internal(VALUE self, const text_source_t *src, size_t c
 
     float *out = run.out;
     run.out = NULL;
-    VALUE texts_guard = src->texts;
-    RB_GC_GUARD(texts_guard);
+    VALUE snapshot_guard = source.snapshot;
+    RB_GC_GUARD(snapshot_guard);
     (void)out_bytes;
     return binary_string_from_floats(out, floats, format);
 }
@@ -917,10 +984,7 @@ static VALUE embed_texts_internal(VALUE self, const text_source_t *src, size_t c
 static VALUE embed_batch_internal(VALUE self, VALUE texts, VALUE max_tokens_opt,
                                   se_vector_format_t format) {
     Check_Type(texts, T_ARRAY);
-    text_source_t src;
-    src.texts = texts;
-    src.is_array = 1;
-    return embed_texts_internal(self, &src, (size_t)RARRAY_LEN(texts), max_tokens_opt, format,
+    return embed_texts_internal(self, texts, 1, (size_t)RARRAY_LEN(texts), max_tokens_opt, format,
                                 NULL);
 }
 
@@ -936,10 +1000,7 @@ static VALUE model_embed_batch(int argc, VALUE *argv, VALUE self) {
 
 static VALUE embed_one_via_batch(VALUE self, VALUE text, VALUE max_tokens_opt,
                                  se_vector_format_t format, se_token_stats_t *stats) {
-    text_source_t src;
-    src.texts = text;
-    src.is_array = 0;
-    return embed_texts_internal(self, &src, 1, max_tokens_opt, format, stats);
+    return embed_texts_internal(self, text, 0, 1, max_tokens_opt, format, stats);
 }
 
 static VALUE embed_one_value(VALUE self, VALUE text, VALUE max_tokens_opt,
@@ -962,7 +1023,7 @@ static VALUE embed_one_value(VALUE self, VALUE text, VALUE max_tokens_opt,
 
     se_scratch_t scratch;
     se_scratch_init(&scratch);
-    if (!se_scratch_reserve(&scratch, (size_t)RSTRING_LEN(text), dim)) {
+    if (!se_scratch_reserve(&scratch, dim)) {
         se_scratch_free(&scratch);
         rb_raise(rb_eNoMemError, "out of memory");
     }
@@ -1020,7 +1081,7 @@ static VALUE model_tokenize(int argc, VALUE *argv, VALUE self) {
 
     se_scratch_t scratch;
     se_scratch_init(&scratch);
-    if (!se_scratch_reserve(&scratch, (size_t)RSTRING_LEN(text), w->model.meta.dim)) {
+    if (!se_scratch_reserve(&scratch, w->model.meta.dim)) {
         se_scratch_free(&scratch);
         rb_raise(rb_eNoMemError, "out of memory");
     }
@@ -1084,7 +1145,7 @@ static void *ids_execute(void *arg) {
     ids_job_t *job = (ids_job_t *)arg;
     se_scratch_t scratch;
     se_scratch_init(&scratch);
-    if (!se_scratch_reserve(&scratch, job->n_ids, job->model->meta.dim)) {
+    if (!se_scratch_reserve(&scratch, job->model->meta.dim)) {
         se_error_set(&job->error, SE_ERR_OOM, "out of memory while sizing scratch buffers");
         se_scratch_free(&scratch);
         return NULL;
@@ -1256,15 +1317,12 @@ typedef struct {
 } topk_job_t;
 
 typedef struct {
-    VALUE query;
     VALUE matrix;
     topk_job_t job;
     float *q_copy;
     float *matrix_copy;
     size_t matrix_bytes;
-    int matrix_locked;
     int release_gvl;
-    VALUE result;
 } topk_run_t;
 
 static int ptr_is_float_aligned(const void *ptr) {
@@ -1451,23 +1509,237 @@ static float dot_and_row_sq_unrolled(const float *q, const float *row, size_t di
     return dot;
 }
 
-static float dot_product_f16(const float *q, const uint8_t *row, size_t dim) {
-    float dot = 0.0f;
-    for (size_t j = 0; j < dim; j++)
+#if defined(SE_NEED_F16_LUT)
+static float dot_product_f16_lut(const float *q, const uint8_t *row, size_t dim) {
+    size_t j = 0;
+    float s0 = 0.0f;
+    float s1 = 0.0f;
+    float s2 = 0.0f;
+    float s3 = 0.0f;
+    for (; j + 3 < dim; j += 4) {
+        s0 += q[j] * se_f16_lut[read_u16le(row + j * 2)];
+        s1 += q[j + 1] * se_f16_lut[read_u16le(row + (j + 1) * 2)];
+        s2 += q[j + 2] * se_f16_lut[read_u16le(row + (j + 2) * 2)];
+        s3 += q[j + 3] * se_f16_lut[read_u16le(row + (j + 3) * 2)];
+    }
+    float dot = (s0 + s1) + (s2 + s3);
+    for (; j < dim; j++)
+        dot += q[j] * se_f16_lut[read_u16le(row + j * 2)];
+    return dot;
+}
+
+static float dot_and_row_sq_f16_lut(const float *q, const uint8_t *row, size_t dim,
+                                    float *row_sq_out) {
+    size_t j = 0;
+    float d0 = 0.0f;
+    float d1 = 0.0f;
+    float d2 = 0.0f;
+    float d3 = 0.0f;
+    float s0 = 0.0f;
+    float s1 = 0.0f;
+    float s2 = 0.0f;
+    float s3 = 0.0f;
+    for (; j + 3 < dim; j += 4) {
+        float r0 = se_f16_lut[read_u16le(row + j * 2)];
+        float r1 = se_f16_lut[read_u16le(row + (j + 1) * 2)];
+        float r2 = se_f16_lut[read_u16le(row + (j + 2) * 2)];
+        float r3 = se_f16_lut[read_u16le(row + (j + 3) * 2)];
+        d0 += q[j] * r0;
+        d1 += q[j + 1] * r1;
+        d2 += q[j + 2] * r2;
+        d3 += q[j + 3] * r3;
+        s0 += r0 * r0;
+        s1 += r1 * r1;
+        s2 += r2 * r2;
+        s3 += r3 * r3;
+    }
+    float dot = (d0 + d1) + (d2 + d3);
+    float row_sq = (s0 + s1) + (s2 + s3);
+    for (; j < dim; j++) {
+        float r = se_f16_lut[read_u16le(row + j * 2)];
+        dot += q[j] * r;
+        row_sq += r * r;
+    }
+    *row_sq_out = row_sq;
+    return dot;
+}
+#endif /* SE_NEED_F16_LUT */
+
+#if defined(SE_HAVE_NEON_FP16)
+static float dot_product_f16_neon(const float *q, const uint8_t *row, size_t dim) {
+    size_t j = 0;
+    float32x4_t a0 = vdupq_n_f32(0.0f);
+    float32x4_t a1 = vdupq_n_f32(0.0f);
+    for (; j + 7 < dim; j += 8) {
+        float16x4_t h0 =
+            vreinterpret_f16_u16(vld1_u16((const uint16_t *)(const void *)(row + j * 2)));
+        float16x4_t h1 =
+            vreinterpret_f16_u16(vld1_u16((const uint16_t *)(const void *)(row + (j + 4) * 2)));
+        float32x4_t r0 = vcvt_f32_f16(h0);
+        float32x4_t r1 = vcvt_f32_f16(h1);
+        a0 = vmlaq_f32(a0, vld1q_f32(q + j), r0);
+        a1 = vmlaq_f32(a1, vld1q_f32(q + j + 4), r1);
+    }
+    float32x4_t sumv = vaddq_f32(a0, a1);
+    float dot = vaddvq_f32(sumv);
+    for (; j < dim; j++)
         dot += q[j] * f16_bits_to_float(read_u16le(row + j * 2));
     return dot;
 }
 
-static float dot_and_row_sq_f16(const float *q, const uint8_t *row, size_t dim, float *row_sq_out) {
-    float dot = 0.0f;
-    float row_sq = 0.0f;
-    for (size_t j = 0; j < dim; j++) {
+static float dot_and_row_sq_f16_neon(const float *q, const uint8_t *row, size_t dim,
+                                     float *row_sq_out) {
+    size_t j = 0;
+    float32x4_t d0 = vdupq_n_f32(0.0f);
+    float32x4_t d1 = vdupq_n_f32(0.0f);
+    float32x4_t s0 = vdupq_n_f32(0.0f);
+    float32x4_t s1 = vdupq_n_f32(0.0f);
+    for (; j + 7 < dim; j += 8) {
+        float16x4_t h0 =
+            vreinterpret_f16_u16(vld1_u16((const uint16_t *)(const void *)(row + j * 2)));
+        float16x4_t h1 =
+            vreinterpret_f16_u16(vld1_u16((const uint16_t *)(const void *)(row + (j + 4) * 2)));
+        float32x4_t r0 = vcvt_f32_f16(h0);
+        float32x4_t r1 = vcvt_f32_f16(h1);
+        d0 = vmlaq_f32(d0, vld1q_f32(q + j), r0);
+        d1 = vmlaq_f32(d1, vld1q_f32(q + j + 4), r1);
+        s0 = vmlaq_f32(s0, r0, r0);
+        s1 = vmlaq_f32(s1, r1, r1);
+    }
+    float dot = vaddvq_f32(vaddq_f32(d0, d1));
+    float row_sq = vaddvq_f32(vaddq_f32(s0, s1));
+    for (; j < dim; j++) {
         float r = f16_bits_to_float(read_u16le(row + j * 2));
         dot += q[j] * r;
         row_sq += r * r;
     }
     *row_sq_out = row_sq;
     return dot;
+}
+#endif
+
+#if defined(SE_HAVE_X86_F16C_TARGET)
+__attribute__((target("f16c,avx"))) static float hsum256_f16c(__m256 v) {
+    __m128 low = _mm256_castps256_ps128(v);
+    __m128 high = _mm256_extractf128_ps(v, 1);
+    __m128 sum = _mm_add_ps(low, high);
+    float tmp[4];
+    _mm_storeu_ps(tmp, sum);
+    return (tmp[0] + tmp[1]) + (tmp[2] + tmp[3]);
+}
+
+__attribute__((target("f16c,avx"))) static float
+dot_product_f16_f16c(const float *q, const uint8_t *row, size_t dim) {
+    size_t j = 0;
+    __m256 a0 = _mm256_setzero_ps();
+    __m256 a1 = _mm256_setzero_ps();
+    for (; j + 15 < dim; j += 16) {
+        __m256 r0 = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(const void *)(row + j * 2)));
+        __m256 r1 =
+            _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(const void *)(row + (j + 8) * 2)));
+        a0 = _mm256_add_ps(a0, _mm256_mul_ps(_mm256_loadu_ps(q + j), r0));
+        a1 = _mm256_add_ps(a1, _mm256_mul_ps(_mm256_loadu_ps(q + j + 8), r1));
+    }
+    float dot = hsum256_f16c(_mm256_add_ps(a0, a1));
+    for (; j + 7 < dim; j += 8) {
+        __m256 r = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(const void *)(row + j * 2)));
+        dot += hsum256_f16c(_mm256_mul_ps(_mm256_loadu_ps(q + j), r));
+    }
+    for (; j < dim; j++)
+        dot += q[j] * f16_bits_to_float(read_u16le(row + j * 2));
+    return dot;
+}
+
+__attribute__((target("f16c,avx"))) static float
+dot_and_row_sq_f16_f16c(const float *q, const uint8_t *row, size_t dim, float *row_sq_out) {
+    size_t j = 0;
+    __m256 d0 = _mm256_setzero_ps();
+    __m256 d1 = _mm256_setzero_ps();
+    __m256 s0 = _mm256_setzero_ps();
+    __m256 s1 = _mm256_setzero_ps();
+    for (; j + 15 < dim; j += 16) {
+        __m256 r0 = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(const void *)(row + j * 2)));
+        __m256 r1 =
+            _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(const void *)(row + (j + 8) * 2)));
+        d0 = _mm256_add_ps(d0, _mm256_mul_ps(_mm256_loadu_ps(q + j), r0));
+        d1 = _mm256_add_ps(d1, _mm256_mul_ps(_mm256_loadu_ps(q + j + 8), r1));
+        s0 = _mm256_add_ps(s0, _mm256_mul_ps(r0, r0));
+        s1 = _mm256_add_ps(s1, _mm256_mul_ps(r1, r1));
+    }
+    float dot = hsum256_f16c(_mm256_add_ps(d0, d1));
+    float row_sq = hsum256_f16c(_mm256_add_ps(s0, s1));
+    for (; j + 7 < dim; j += 8) {
+        __m256 r = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(const void *)(row + j * 2)));
+        dot += hsum256_f16c(_mm256_mul_ps(_mm256_loadu_ps(q + j), r));
+        row_sq += hsum256_f16c(_mm256_mul_ps(r, r));
+    }
+    for (; j < dim; j++) {
+        float r = f16_bits_to_float(read_u16le(row + j * 2));
+        dot += q[j] * r;
+        row_sq += r * r;
+    }
+    *row_sq_out = row_sq;
+    return dot;
+}
+#endif
+
+static float dot_product_f16(const float *q, const uint8_t *row, size_t dim) {
+#if defined(SE_HAVE_NEON_FP16)
+    return dot_product_f16_neon(q, row, dim);
+#else
+#if defined(SE_HAVE_X86_F16C_TARGET)
+    if (se_f16_backend == SE_F16_BACKEND_F16C)
+        return dot_product_f16_f16c(q, row, dim);
+#endif
+    return dot_product_f16_lut(q, row, dim);
+#endif
+}
+
+static float dot_and_row_sq_f16(const float *q, const uint8_t *row, size_t dim, float *row_sq_out) {
+#if defined(SE_HAVE_NEON_FP16)
+    return dot_and_row_sq_f16_neon(q, row, dim, row_sq_out);
+#else
+#if defined(SE_HAVE_X86_F16C_TARGET)
+    if (se_f16_backend == SE_F16_BACKEND_F16C)
+        return dot_and_row_sq_f16_f16c(q, row, dim, row_sq_out);
+#endif
+    return dot_and_row_sq_f16_lut(q, row, dim, row_sq_out);
+#endif
+}
+
+static void select_f16_backend(void) {
+#if defined(SE_HAVE_NEON_FP16)
+    se_f16_backend = SE_F16_BACKEND_NEON_FP16;
+#else
+#if defined(SE_HAVE_X86_F16C_TARGET)
+    if (detect_x86_f16c()) {
+        se_f16_backend = SE_F16_BACKEND_F16C;
+        return;
+    }
+#endif
+    se_f16_backend = SE_F16_BACKEND_LUT;
+    init_f16_lut();
+#endif
+}
+
+static VALUE se_simd_backend(VALUE self) {
+    (void)self;
+    switch (se_f16_backend) {
+    case SE_F16_BACKEND_NEON_FP16:
+        return rb_str_new_cstr("neon-fp16");
+    case SE_F16_BACKEND_F16C:
+        return rb_str_new_cstr("f16c");
+    default:
+        return rb_str_new_cstr("lut");
+    }
+}
+
+static float cosine_score(float dot, float row_sq, float inv_query_norm) {
+    if (row_sq > 0.0f)
+        return dot * inv_query_norm / sqrtf(row_sq);
+    if (row_sq == 0.0f)
+        return 0.0f;
+    return NAN;
 }
 
 static void *topk_execute(void *arg) {
@@ -1482,7 +1754,7 @@ static void *topk_execute(void *arg) {
             if (job->cosine) {
                 float row_sq = 0.0f;
                 score = dot_and_row_sq_f16(job->q, row, job->dim, &row_sq);
-                score = row_sq > 0.0f ? score * job->inv_query_norm / sqrtf(row_sq) : 0.0f;
+                score = cosine_score(score, row_sq, job->inv_query_norm);
             } else {
                 score = dot_product_f16(job->q, row, job->dim);
             }
@@ -1491,7 +1763,7 @@ static void *topk_execute(void *arg) {
             if (job->cosine) {
                 float row_sq = 0.0f;
                 score = dot_and_row_sq_unrolled(job->q, row, job->dim, &row_sq);
-                score = row_sq > 0.0f ? score * job->inv_query_norm / sqrtf(row_sq) : 0.0f;
+                score = cosine_score(score, row_sq, job->inv_query_norm);
             } else {
                 score = dot_product_unrolled(job->q, row, job->dim);
             }
@@ -1516,10 +1788,7 @@ static VALUE topk_body(VALUE arg) {
     topk_run_t *run = (topk_run_t *)(uintptr_t)arg;
     const char *matrix_ptr = RSTRING_PTR(run->matrix);
 
-    if (run->job.format == SE_VECTOR_FORMAT_F32 && !ptr_is_float_aligned(matrix_ptr)) {
-        run->matrix_copy = (float *)malloc(run->matrix_bytes ? run->matrix_bytes : 1);
-        if (!run->matrix_copy)
-            rb_raise(rb_eNoMemError, "out of memory");
+    if (run->matrix_copy) {
         memcpy(run->matrix_copy, matrix_ptr, run->matrix_bytes);
         run->job.m = run->matrix_copy;
     } else {
@@ -1533,15 +1802,7 @@ static VALUE topk_body(VALUE arg) {
         run->job.inv_query_norm = 1.0f / sqrtf(query_sq);
     }
 
-    if (run->release_gvl && !run->matrix_copy) {
-        rb_str_locktmp(run->matrix);
-        run->matrix_locked = 1;
-        run->job.m = RSTRING_PTR(run->matrix);
-        rb_thread_call_without_gvl(topk_execute, &run->job, topk_unblock_cancel, &run->job);
-        rb_thread_check_ints();
-        rb_str_unlocktmp(run->matrix);
-        run->matrix_locked = 0;
-    } else if (run->release_gvl) {
+    if (run->release_gvl) {
         rb_thread_call_without_gvl(topk_execute, &run->job, topk_unblock_cancel, &run->job);
         rb_thread_check_ints();
     } else {
@@ -1561,16 +1822,11 @@ static VALUE topk_body(VALUE arg) {
         rb_ary_push(pair, DBL2NUM((double)run->job.best_score[i]));
         rb_ary_push(result, pair);
     }
-    run->result = result;
     return result;
 }
 
 static VALUE topk_ensure(VALUE arg) {
     topk_run_t *run = (topk_run_t *)(uintptr_t)arg;
-    if (run->matrix_locked) {
-        rb_str_unlocktmp(run->matrix);
-        run->matrix_locked = 0;
-    }
     free(run->q_copy);
     free(run->matrix_copy);
     free(run->job.best_idx);
@@ -1580,6 +1836,53 @@ static VALUE topk_ensure(VALUE arg) {
     run->job.best_idx = NULL;
     run->job.best_score = NULL;
     return Qnil;
+}
+
+static size_t topk_required_dim(VALUE opts) {
+    VALUE v = lookup_option(opts, id_dim);
+    if (v == Qundef || v == Qnil)
+        rb_raise(rb_eArgError, "dim: is required (raw blobs carry no dimension or format tag); "
+                               "pass dim: model.dim, or call model.cosine_top_k / model.dot_top_k");
+
+    long dim = NUM2LONG(v);
+    if (dim < 1)
+        rb_raise(rb_eArgError, "dim: must be >= 1");
+    return (size_t)dim;
+}
+
+static void topk_check_matrix(VALUE matrix, size_t matrix_bytes, se_vector_format_t format,
+                              VALUE opts, int *release_gvl, int *needs_copy) {
+    int large = matrix_bytes >= SE_TOPK_GVL_UNLOCK_THRESHOLD;
+    int aligned = format != SE_VECTOR_FORMAT_F32 || ptr_is_float_aligned(RSTRING_PTR(matrix));
+    VALUE allow_unfrozen = lookup_option(opts, id_allow_unfrozen);
+
+    *release_gvl = 0;
+    *needs_copy = 0;
+
+    if (!large) {
+        *needs_copy = !aligned;
+        return;
+    }
+
+    if (!aligned)
+        rb_raise(rb_eArgError,
+                 "matrix blob is not 4-byte aligned; copying %zu bytes would be silently "
+                 "expensive - pass a freshly packed String instead of a byteslice",
+                 matrix_bytes);
+
+    if (RB_OBJ_FROZEN(matrix)) {
+        *release_gvl = 1;
+        return;
+    }
+
+    if (allow_unfrozen != Qundef && RTEST(allow_unfrozen))
+        return;
+
+    rb_raise(rb_eArgError,
+             "a matrix of %zu bytes is scanned with the GVL released and must be frozen so that "
+             "no other thread can mutate it; call matrix.freeze, or pass allow_unfrozen: true to "
+             "scan it while holding the GVL",
+             matrix_bytes);
 }
 
 static VALUE top_k_impl(int argc, VALUE *argv, VALUE self, int cosine) {
@@ -1592,18 +1895,21 @@ static VALUE top_k_impl(int argc, VALUE *argv, VALUE self, int cosine) {
 
     se_vector_format_t format = resolve_vector_format(lookup_option(opts, id_format));
     size_t element_bytes = vector_format_element_bytes(format);
+    size_t dim = topk_required_dim(opts);
 
-    long qbytes = RSTRING_LEN(query);
-    if (qbytes == 0 || qbytes % (long)element_bytes != 0)
-        rb_raise(rb_eArgError, "query must be a non-empty embedding blob matching format");
-
-    size_t dim = (size_t)qbytes / element_bytes;
-    long mbytes = RSTRING_LEN(matrix);
     size_t row_bytes;
     if (!checked_mul_size(dim, element_bytes, &row_bytes) || !size_fits_long(row_bytes))
-        rb_raise(rb_eArgError, "query dimension is too large");
-    if (mbytes % (long)row_bytes != 0)
-        rb_raise(rb_eArgError, "matrix length is not a multiple of the query dimension");
+        rb_raise(rb_eArgError, "dim: is too large");
+
+    if ((size_t)RSTRING_LEN(query) != row_bytes)
+        rb_raise(rb_eArgError, "query is %ld bytes but dim: %zu with format %s needs %zu bytes",
+                 RSTRING_LEN(query), dim, format == SE_VECTOR_FORMAT_F16 ? ":f16" : ":f32",
+                 row_bytes);
+
+    long mbytes = RSTRING_LEN(matrix);
+    if ((size_t)mbytes % row_bytes != 0)
+        rb_raise(rb_eArgError, "matrix is %ld bytes, which is not a whole number of %zu-byte rows",
+                 mbytes, row_bytes);
 
     size_t rows = (size_t)mbytes / row_bytes;
     long k = NUM2LONG(k_val);
@@ -1615,13 +1921,15 @@ static VALUE top_k_impl(int argc, VALUE *argv, VALUE self, int cosine) {
         k = (long)rows;
 
     size_t matrix_bytes = (size_t)mbytes;
+    int release_gvl = 0;
+    int needs_copy = 0;
+    topk_check_matrix(matrix, matrix_bytes, format, opts, &release_gvl, &needs_copy);
 
     topk_run_t run;
     memset(&run, 0, sizeof(run));
-    run.query = query;
     run.matrix = matrix;
     run.matrix_bytes = matrix_bytes;
-    run.release_gvl = matrix_bytes >= SE_TOPK_GVL_UNLOCK_THRESHOLD;
+    run.release_gvl = release_gvl;
     run.job.format = format;
     run.job.dim = dim;
     run.job.rows = rows;
@@ -1631,15 +1939,19 @@ static VALUE top_k_impl(int argc, VALUE *argv, VALUE self, int cosine) {
 
     size_t q_float_bytes;
     if (!checked_mul_size(dim, sizeof(float), &q_float_bytes))
-        rb_raise(rb_eArgError, "query dimension is too large");
+        rb_raise(rb_eArgError, "dim: is too large");
 
     run.q_copy = (float *)malloc(q_float_bytes);
     run.job.best_idx = (size_t *)calloc((size_t)k, sizeof(size_t));
     run.job.best_score = (float *)malloc((size_t)k * sizeof(float));
-    if (!run.q_copy || !run.job.best_idx || !run.job.best_score) {
+    if (needs_copy)
+        run.matrix_copy = (float *)malloc(matrix_bytes ? matrix_bytes : 1);
+    if (!run.q_copy || !run.job.best_idx || !run.job.best_score ||
+        (needs_copy && !run.matrix_copy)) {
         topk_ensure((VALUE)(uintptr_t)&run);
         rb_raise(rb_eNoMemError, "out of memory");
     }
+
     if (format == SE_VECTOR_FORMAT_F16)
         decode_f16_to_floats(run.q_copy, (const uint8_t *)RSTRING_PTR(query), dim);
     else
@@ -1664,7 +1976,43 @@ static VALUE se_dot_top_k(int argc, VALUE *argv, VALUE self) {
     return top_k_impl(argc, argv, self, 0);
 }
 
+static VALUE se_encode_f16(VALUE self, VALUE ary) {
+    (void)self;
+    Check_Type(ary, T_ARRAY);
+
+    long n = RARRAY_LEN(ary);
+    size_t bytes;
+    if (!checked_mul_size((size_t)n, 2, &bytes) || !size_fits_long(bytes))
+        rb_raise(rb_eArgError, "vector is too large");
+
+    VALUE out = rb_str_new(NULL, (long)bytes);
+    rb_enc_associate(out, binary_encoding);
+    for (long i = 0; i < n; i++) {
+        double v = NUM2DBL(rb_ary_entry(ary, i));
+        write_u16le((uint8_t *)RSTRING_PTR(out) + (size_t)i * 2, float_to_f16_bits((float)v));
+    }
+    return out;
+}
+
+static VALUE se_decode_f16(VALUE self, VALUE blob) {
+    (void)self;
+    Check_Type(blob, T_STRING);
+
+    long n = RSTRING_LEN(blob);
+    if (n % 2 != 0)
+        rb_raise(rb_eArgError, "f16 blob byte size must be a multiple of 2");
+
+    VALUE out = rb_ary_new_capa(n / 2);
+    for (long i = 0; i < n / 2; i++) {
+        const uint8_t *src = (const uint8_t *)RSTRING_PTR(blob) + (size_t)i * 2;
+        rb_ary_push(out, DBL2NUM((double)f16_bits_to_float(read_u16le(src))));
+    }
+    RB_GC_GUARD(blob);
+    return out;
+}
+
 RUBY_FUNC_EXPORTED void Init_static_embeddings(void) {
+    select_f16_backend();
     binary_encoding = rb_ascii8bit_encoding();
     utf8_encoding = rb_utf8_encoding();
     id_join = rb_intern("join");
@@ -1677,6 +2025,8 @@ RUBY_FUNC_EXPORTED void Init_static_embeddings(void) {
     id_token_count = rb_intern("token_count");
     id_unk_count = rb_intern("unk_count");
     id_truncated = rb_intern("truncated");
+    id_dim = rb_intern("dim");
+    id_allow_unfrozen = rb_intern("allow_unfrozen");
 
     mStaticEmbeddings = rb_define_module("StaticEmbeddings");
     cFiber = rb_const_get(rb_cObject, rb_intern("Fiber"));
@@ -1710,6 +2060,9 @@ RUBY_FUNC_EXPORTED void Init_static_embeddings(void) {
 
     rb_define_singleton_method(mStaticEmbeddings, "cosine_top_k", se_cosine_top_k, -1);
     rb_define_singleton_method(mStaticEmbeddings, "dot_top_k", se_dot_top_k, -1);
+    rb_define_singleton_method(mStaticEmbeddings, "encode_f16", se_encode_f16, 1);
+    rb_define_singleton_method(mStaticEmbeddings, "decode_f16", se_decode_f16, 1);
+    rb_define_singleton_method(mStaticEmbeddings, "simd_backend", se_simd_backend, 0);
 
     rb_define_const(mStaticEmbeddings, "FORMAT_VERSION", UINT2NUM(SE_FORMAT_VERSION));
     rb_define_const(mStaticEmbeddings, "TOKENIZER_BERT_WORDPIECE_V1",

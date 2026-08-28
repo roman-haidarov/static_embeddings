@@ -88,9 +88,7 @@ static int push_id(se_scratch_t *sc, size_t *n_ids, uint32_t id) {
     return 1;
 }
 
-int se_scratch_reserve(se_scratch_t *s, size_t input_bytes, uint32_t dim) {
-    (void)input_bytes;
-
+int se_scratch_reserve(se_scratch_t *s, uint32_t dim) {
     if (!grow_u32(&s->cps, &s->cps_cap, 256))
         return 0;
     if (!grow_u32(&s->cps2, &s->cps2_cap, 256))
@@ -164,6 +162,65 @@ static int decode_one(const uint8_t *src, size_t len, size_t *i, uint32_t *cp_ou
     *cp_out = cp;
     *i += need + 1;
     return 1;
+}
+
+static int normalization_stable(const se_model_t *m, uint32_t cp) {
+    if (cp < 0x80)
+        return 1;
+    if (m->meta.do_lower_case && se_map_lookup(m->norm.lower, m->norm.lower_count, cp))
+        return 0;
+    if (m->meta.strip_accents) {
+        if (se_map_lookup(m->norm.nfd, m->norm.nfd_count, cp))
+            return 0;
+        if (se_range_contains(m->norm.mn, m->norm.mn_count, cp))
+            return 0;
+    }
+    return 1;
+}
+
+static int cp_is_cjk_segment(const se_model_t *m, uint32_t cp) {
+    return m->meta.handle_chinese_chars && cp >= 0x3400 && se_is_cjk(cp);
+}
+
+size_t se_prefix_boundary_len(const se_model_t *model, const uint8_t *input, size_t input_len,
+                              size_t target, size_t backscan) {
+    if (target >= input_len)
+        return input_len;
+    if (target == 0)
+        return 0;
+
+    size_t floor = target > backscan ? target - backscan : 0;
+    size_t pos = target;
+
+    while (pos > floor) {
+        pos--;
+        while (pos > floor && (input[pos] & 0xC0) == 0x80)
+            pos--;
+        if ((input[pos] & 0xC0) == 0x80)
+            return 0;
+
+        uint32_t cp = 0;
+        size_t scan = pos;
+        if (!decode_one(input, input_len, &scan, &cp))
+            return 0;
+        size_t after = scan;
+
+        if (!normalization_stable(model, cp))
+            continue;
+
+        if (cp_is_cjk_segment(model, cp)) {
+            if (after <= target)
+                return after;
+            if (pos > 0)
+                return pos;
+            return 0;
+        }
+
+        if ((is_whitespace(model, cp) || is_punct(model, cp)) && after <= target)
+            return after;
+    }
+
+    return 0;
 }
 
 typedef struct {

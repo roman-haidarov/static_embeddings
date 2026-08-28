@@ -238,7 +238,10 @@ static inline int se_is_ascii_boundary(uint32_t cp) {
 
 void se_scratch_init(se_scratch_t *s);
 void se_scratch_free(se_scratch_t *s);
-int se_scratch_reserve(se_scratch_t *s, size_t input_bytes, uint32_t dim);
+int se_scratch_reserve(se_scratch_t *s, uint32_t dim);
+
+size_t se_prefix_boundary_len(const se_model_t *model, const uint8_t *input, size_t input_len,
+                              size_t target, size_t backscan);
 
 typedef struct {
     uint32_t token_count;

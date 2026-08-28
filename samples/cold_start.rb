@@ -66,6 +66,12 @@ puts "rss_after_first_embed_kb=#{rss_after_first}"
 puts "rss_after_warmup_kb=#{rss_after_warmup}"
 puts "rss_growth_kb=#{rss_after_warmup - rss_start}"
 puts
-ratio = t_second_warmup.zero? ? 0.0 : t_warmup / t_second_warmup
-puts "cold_confidence_ratio=#{format('%.2f', ratio)}"
-puts "cold_page_cache=#{ratio > 2.0 ? "likely" : "unlikely — drop the page cache and rerun"}"
+residency_ratio = t_second_warmup.zero? ? 0.0 : t_warmup / t_second_warmup
+bytes_per_sec = t_warmup.zero? ? 0.0 : model.mapped_bytes / t_warmup
+
+puts "warmup_residency_ratio=#{format('%.2f', residency_ratio)}"
+puts "warmup_mapped_bytes_per_sec=#{format('%.0f', bytes_per_sec)}"
+puts "warmup_mapped_gb_per_sec=#{format('%.2f', bytes_per_sec / 1e9)}"
+puts "page_cache_state=unknown"
+puts "page_cache_note=a true cold-start number requires dropping the OS page cache first " \
+     "(macOS: sudo purge, Linux: echo 3 > /proc/sys/vm/drop_caches) and running this sample once"

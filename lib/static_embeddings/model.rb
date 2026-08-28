@@ -27,6 +27,18 @@ module StaticEmbeddings
       StaticEmbeddings.unpack(embed_batch(texts, **opts), dim, format: format)
     end
 
+    def cosine_top_k(query_blob, matrix_blob, k, **opts)
+      raise ArgumentError, "dim: is set by the model" if opts.key?(:dim)
+
+      StaticEmbeddings.cosine_top_k(query_blob, matrix_blob, k, **opts.merge(dim: dim))
+    end
+
+    def dot_top_k(query_blob, matrix_blob, k, **opts)
+      raise ArgumentError, "dim: is set by the model" if opts.key?(:dim)
+
+      StaticEmbeddings.dot_top_k(query_blob, matrix_blob, k, **opts.merge(dim: dim))
+    end
+
     def to_s
       "#<StaticEmbeddings::Model #{model_id || path} dim=#{dim} vocab=#{vocab_size}>"
     end

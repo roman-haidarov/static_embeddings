@@ -17,6 +17,8 @@ Source model:
 - Oracle rows: `28`
 - Oracle dimension: `512`
 - Oracle max length: `512`
+- Runtime checked with: `static_embeddings 0.1.1`
+- Runtime source note: re-run parity after changing tokenizer, normalizer, prefix-window, pooling, or output-normalization code.
 
 Converted `.semb`:
 

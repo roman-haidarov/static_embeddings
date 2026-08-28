@@ -159,6 +159,16 @@ accumulates each row's sum of squares so it can divide by the true norms.
 deliberately absent is a dependency on BLAS: pooling is gathering random
 embedding rows, not a dense matrix multiply.
 
+A matrix at or above `SE_TOPK_GVL_UNLOCK_THRESHOLD` (1 MiB) is scanned with the
+GVL released and must therefore be frozen. The alternatives were both bad:
+copying a corpus-sized blob on every query defeats the purpose of the API, and
+`rb_str_locktmp` is an exclusive lock, so it turns a read-only shared corpus
+into something exactly one thread at a time may search. Freezing removes the
+mutation hazard outright and keeps the scan lock-free. Because a raw blob has no
+dimension or format tag, `dim:` is required and the query length is checked
+against it; that is what stops an f32 query and an f16 matrix from dividing out
+to a consistent-looking row count.
+
 Top-k insertion uses `!(score > worst)` rather than `score <= worst` so that a
 `NaN` score is skipped. With the naive comparison a single `NaN` row would fall
 through the early exit, settle at the last slot and then make every subsequent
@@ -173,27 +183,43 @@ therefore serialised the process on work that the tokenizer would discard after
 `max_tokens` anyway.
 
 `embed` and `embed_batch` instead copy a leading slice. The budget starts at
-`max_tokens * 16` bytes clamped to `[4096, 65536]`, and the slice is cut
-immediately after an ASCII byte that ends a WordPiece word. A result is accepted
-only when that slice actually reached `max_tokens`; otherwise the budget doubles
-and the text is tokenized again. Growth is geometric, so the pathological case
-costs about twice the single-pass work.
+`max_tokens * 16` bytes clamped to `[4096, 65536]`, and the slice is cut at a
+position where the tokenizer would have started a fresh word. A result is
+accepted only when that slice actually reached `max_tokens`; otherwise the
+budget doubles and the text is tokenized again. Growth is geometric, so the
+pathological case costs about twice the single-pass work.
 
 Three properties make this exact rather than approximate:
 
-- An ASCII byte can never be a UTF-8 continuation byte, so the cut always lands
-  on a codepoint boundary.
+- The scan only stops on UTF-8 lead bytes, so the cut always lands on a
+  codepoint boundary.
 - WordPiece segmentation is word-local, so the token stream of a prefix cut at a
   word boundary is a prefix of the token stream of the whole document.
 - Normalization carries no state across a word boundary: combining marks are
   dropped independently, CJK characters are wrapped in spaces individually, and
   control characters are deleted pointwise.
 
-The boundary predicate is `se_is_ascii_boundary`, and the tokenizer's own
-`is_whitespace`/`is_punct` call the same helpers. That sharing is load bearing:
-if the two definitions ever diverged, only documents larger than the prefix
-window would tokenize differently. `test/prefix_chunking_test.rb` sweeps every
-printable ASCII separator to catch exactly that.
+The boundary predicate is `se_prefix_boundary_len`, and it lives in
+`se_tokenizer.c` next to the tokenizer so it can call the very same
+`is_whitespace` / `is_punct` / `se_is_cjk` predicates rather than a parallel
+copy of them. A position is a legal cut when the codepoint ending there is
+whitespace or punctuation, or when either side of it is a CJK codepoint - CJK is
+space-wrapped by `emit_cleaned`, so both of its edges are word boundaries.
+Codepoints that the normaliser rewrites (lowercase map, NFD map, dropped
+combining marks) are skipped: their class after normalisation is not necessarily
+their class before it.
+
+Restricting the cut to ASCII, as 0.1.0 did, was correct but degenerate: a CJK or
+NBSP-separated document has no ASCII byte anywhere, so the budget grew to the
+full length and the whole input was copied under the GVL after all. That is why
+the predicate is Unicode-aware. Text with genuinely no legal cut inside the scan
+window - one enormous word, a run of combining marks - still falls back to a
+full copy, because there is nothing else that would be correct.
+
+`test/prefix_chunking_test.rb` sweeps every printable ASCII separator, checks
+CJK, NBSP and Unicode-punctuation documents against
+`embed_token_ids(tokenize(text))`, and asserts that quadrupling the input does
+not triple the cost.
 
 With `max_tokens: false` there is nothing to truncate and the whole input is
 copied.
