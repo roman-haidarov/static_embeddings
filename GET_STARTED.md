@@ -13,7 +13,7 @@ bundle exec rake demo_model # build the tiny model shipped in the gem
 ```ruby
 require "static_embeddings"
 
-model = StaticEmbeddings.load_builtin   # after bundle exec rake demo_model
+model = StaticEmbeddings.load_builtin   # checkout only, after bundle exec rake demo_model
 
 model.embed_array("hello world")
 model.tokenize("Привет, мир!")

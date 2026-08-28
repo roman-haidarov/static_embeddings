@@ -86,12 +86,21 @@ module StaticEmbeddings
         when :f16
           raise ArgumentError, "f16 blob byte size must be a multiple of 2" unless (blob.bytesize % 2).zero?
 
-          blob.unpack("S<*").map { |half| half_to_float(half) }
+          decode_f16(blob)
         end
 
       raise ArgumentError, "blob is not a multiple of dim" unless (floats.length % dim).zero?
 
       floats.each_slice(dim).to_a
+    end
+
+    def pack(rows, format: :f32)
+      flat = rows.first.is_a?(Array) ? rows.flatten(1) : rows
+
+      case normalize_format(format)
+      when :f32 then flat.map(&:to_f).pack("e*")
+      when :f16 then encode_f16(flat.map(&:to_f))
+      end
     end
 
     def normalize_format(format)
@@ -105,30 +114,5 @@ module StaticEmbeddings
       end
     end
 
-    def half_to_float(half)
-      sign = (half & 0x8000) << 16
-      exp = (half >> 10) & 0x1f
-      mant = half & 0x03ff
-
-      bits = if exp.zero?
-        if mant.zero?
-          sign
-        else
-          exp = 1
-          while (mant & 0x0400).zero?
-            mant <<= 1
-            exp -= 1
-          end
-          mant &= 0x03ff
-          sign | ((exp + (127 - 15)) << 23) | (mant << 13)
-        end
-      elsif exp == 31
-        sign | 0x7f800000 | (mant << 13)
-      else
-        sign | ((exp + (127 - 15)) << 23) | (mant << 13)
-      end
-
-      [bits].pack("L<").unpack1("e")
-    end
   end
 end

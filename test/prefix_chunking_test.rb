@@ -121,4 +121,63 @@ class PrefixChunkingTest < Minitest::Test
     first = @model.embed(text)
     5.times { assert_equal first, @model.embed(text) }
   end
+
+  def test_cjk_document_uses_the_prefix_path
+    text = "中文测试文本内容" * 40_000
+    assert_operator text.bytesize, :>, LARGE_BYTES
+    assert_prefix_path_matches(text, "cjk without any ascii byte")
+    assert_prefix_cost_is_flat(text)
+  end
+
+  def test_nbsp_separated_document_uses_the_prefix_path
+    text = "слово\u00a0" * 40_000
+    assert_operator text.bytesize, :>, LARGE_BYTES
+    assert_prefix_path_matches(text, "cyrillic separated by U+00A0")
+    assert_prefix_cost_is_flat(text)
+  end
+
+  def test_unicode_punctuation_is_a_boundary
+    text = "слово\u3002" * 40_000 # ideographic full stop
+    assert_prefix_path_matches(text, "cyrillic separated by unicode punctuation")
+  end
+
+  def test_mixed_cjk_and_ascii_document
+    text = ("中文测试 hello world 文本内容 " * 20_000)
+    assert_prefix_path_matches(text, "mixed cjk and ascii")
+  end
+
+  def test_document_made_only_of_combining_marks_still_matches
+    # Nothing here is a legal cut, so this must fall back to a full copy and
+    # still produce the same vector.
+    text = "\u0301" * 100_000
+    assert_prefix_path_matches(text, "combining marks only")
+  end
+
+  def test_batch_mixes_cjk_and_ascii_documents
+    texts = ["中文测试文本内容" * 20_000,
+             "postgres pipeline mode in ruby " * 20_000,
+             "слово\u00a0" * 20_000,
+             "short"]
+    expected = texts.map { |t| @model.embed(t) }.join
+
+    assert_equal expected, @model.embed_batch(texts)
+  end
+
+  def assert_prefix_cost_is_flat(text)
+    quadruple = text * 4
+    @model.embed(text)
+    @model.embed(quadruple)
+
+    small = time_embed(text)
+    large = time_embed(quadruple)
+
+    assert_operator large, :<, small * 3,
+                    "cost grew with input size (#{small.round(6)}s -> #{large.round(6)}s)"
+  end
+
+  def time_embed(text, n = 20)
+    started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    n.times { @model.embed(text) }
+    (Process.clock_gettime(Process::CLOCK_MONOTONIC) - started) / n
+  end
 end

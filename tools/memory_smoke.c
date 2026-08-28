@@ -64,7 +64,7 @@ int main(int argc, char **argv) {
 
     size_t count = sizeof(texts) / sizeof(texts[0]);
     for (size_t i = 0; i < count; i++) {
-        if (!se_scratch_reserve(&scratch, strlen(texts[i]), model.meta.dim)) {
+        if (!se_scratch_reserve(&scratch, model.meta.dim)) {
             free(out);
             se_scratch_free(&scratch);
             se_model_close(&model);

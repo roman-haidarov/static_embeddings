@@ -40,9 +40,9 @@ StaticEmbeddingsSample.print_header(
     input_bytes: text.bytesize,
     batch_texts: texts.length,
     expected_hot_symbols: full_scan ? [
-      "unblock_cancel must appear: FULL_SCAN disables truncation so work outlives the deadline",
-      "se_embed_one / se_tokenize should still be visible inside interrupted work",
-      "single_timeouts and batch_timeouts must both be > 0 or this run proves nothing"
+      "FULL_SCAN disables truncation so work outlives the deadline",
+      "single_timeouts and batch_timeouts must both be > 0 or this run proves nothing",
+      "unblock_cancel may appear in the profiler, but timeouts/RSS are the proof"
     ] : [
       "this mode measures GVL fairness, NOT cancellation",
       "thread_ticks close to duration/0.001 means other Ruby threads kept running",
