@@ -4,7 +4,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define SE_SIZE_MAX          ((size_t)-1)
 #define SE_CANCEL_CHECK_MASK 0x3ffu
 
 void se_scratch_init(se_scratch_t *s) {
@@ -12,70 +11,58 @@ void se_scratch_init(se_scratch_t *s) {
 }
 
 void se_scratch_free(se_scratch_t *s) {
-    free(s->cps);
-    free(s->cps2);
-    free(s->bytes);
-    free(s->ids);
-    free(s->acc);
+    se_free(s->cps);
+    se_free(s->cps2);
+    se_free(s->bytes);
+    se_free(s->ids);
+    se_free(s->acc);
     memset(s, 0, sizeof(*s));
 }
 
-static int grow_u32(uint32_t **buf, size_t *cap, size_t need) {
+static void *grow_buffer(void *buf, size_t *cap, size_t need, size_t elem_size,
+                         size_t min_capacity) {
     if (*cap >= need)
-        return 1;
+        return buf;
 
-    size_t next = *cap ? *cap : 256;
-    while (next < need) {
-        if (next > SE_SIZE_MAX / 2)
-            return 0;
-        next *= 2;
+    size_t next = 0;
+    size_t bytes = 0;
+    if (!se_next_capacity(*cap, need, min_capacity, &next) ||
+        !se_array_bytes(next, elem_size, &bytes)) {
+        return NULL;
     }
 
-    if (next > SE_SIZE_MAX / sizeof(uint32_t))
-        return 0;
+    void *p = se_realloc(SE_ALLOC_SCRATCH, buf, bytes);
+    if (!p)
+        return NULL;
 
-    uint32_t *p = (uint32_t *)realloc(*buf, next * sizeof(uint32_t));
+    *cap = next;
+    return p;
+}
+
+static int grow_u32(uint32_t **buf, size_t *cap, size_t need) {
+    uint32_t *p = (uint32_t *)grow_buffer(*buf, cap, need, sizeof(uint32_t), 256);
     if (!p)
         return 0;
 
     *buf = p;
-    *cap = next;
     return 1;
 }
 
 static int grow_bytes(uint8_t **buf, size_t *cap, size_t need) {
-    if (*cap >= need)
-        return 1;
-
-    size_t next = *cap ? *cap : 256;
-    while (next < need) {
-        if (next > SE_SIZE_MAX / 2)
-            return 0;
-        next *= 2;
-    }
-
-    uint8_t *p = (uint8_t *)realloc(*buf, next);
+    uint8_t *p = (uint8_t *)grow_buffer(*buf, cap, need, sizeof(uint8_t), 256);
     if (!p)
         return 0;
 
     *buf = p;
-    *cap = next;
     return 1;
 }
 
 static int grow_float(float **buf, size_t *cap, size_t need) {
-    if (*cap >= need)
-        return 1;
-
-    if (need > SE_SIZE_MAX / sizeof(float))
-        return 0;
-
-    float *p = (float *)realloc(*buf, need * sizeof(float));
+    float *p = (float *)grow_buffer(*buf, cap, need, sizeof(float), need);
     if (!p)
         return 0;
 
     *buf = p;
-    *cap = need;
     return 1;
 }
 
@@ -111,7 +98,7 @@ static int is_whitespace(const se_model_t *m, uint32_t cp) {
 
 static int is_control(const se_model_t *m, uint32_t cp) {
     if (cp < 0x80)
-        return cp < 0x20 && cp != '\t' && cp != '\n' && cp != '\r';
+        return (cp < 0x20 || cp == 0x7f) && cp != '\t' && cp != '\n' && cp != '\r';
     return se_range_contains(m->norm.control, m->norm.control_count, cp);
 }
 
@@ -223,6 +210,22 @@ size_t se_prefix_boundary_len(const se_model_t *model, const uint8_t *input, siz
     return 0;
 }
 
+typedef enum {
+    SE_ASCII_DROP = 0,
+    SE_ASCII_SPACE = 1,
+    SE_ASCII_PUNCT = 2,
+    SE_ASCII_WORD = 3
+} se_ascii_class_t;
+
+static const uint8_t SE_ASCII_CLASS[128] = {
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 2, 2, 2, 2, 2, 2,
+    2, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 2, 2, 2, 2, 2,
+    2, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 2, 2, 2, 2, 0,
+};
+
+#define SE_ASCII_CANCEL_STRIDE (SE_CANCEL_CHECK_MASK + 1u)
+
 typedef struct {
     const se_model_t *model;
     se_scratch_t *scratch;
@@ -282,9 +285,11 @@ static wordpiece_status_t wordpiece(const se_model_t *m, se_scratch_t *sc, const
         return 1;
     }
 
-    if (word_len > (SE_SIZE_MAX / 4) - 1)
+    size_t bytes_need = 0;
+    if (!se_checked_mul_size(word_len, 4, &bytes_need) ||
+        !se_checked_add_size(bytes_need, 4, &bytes_need))
         return 0;
-    if (!grow_bytes(&sc->bytes, &sc->bytes_cap, word_len * 4 + 4))
+    if (!grow_bytes(&sc->bytes, &sc->bytes_cap, bytes_need))
         return 0;
     if (!grow_u32(&sc->cps2, &sc->cps2_cap, word_len + 1))
         return 0;
@@ -452,6 +457,93 @@ static se_status_t emit_cleaned(token_state_t *st, uint32_t cp, int *stop) {
     return emit_stripped(st, cp, stop);
 }
 
+static inline se_ascii_class_t ascii_class(uint8_t byte) {
+    return (se_ascii_class_t)SE_ASCII_CLASS[byte];
+}
+
+static size_t ascii_word_reserve_len(const uint8_t *input, size_t input_len, size_t i) {
+    size_t run = 1;
+    size_t limit = input_len - i;
+
+    if (limit > SE_ASCII_CANCEL_STRIDE)
+        limit = SE_ASCII_CANCEL_STRIDE;
+
+    while (run < limit && input[i + run] < 0x80 && ascii_class(input[i + run]) == SE_ASCII_WORD)
+        run++;
+
+    return run;
+}
+
+static se_status_t tokenize_ascii_run(token_state_t *st, const uint8_t *input, size_t input_len,
+                                      size_t *ip, int *stop) {
+    size_t i = *ip;
+    size_t next_cancel_check = i + SE_ASCII_CANCEL_STRIDE;
+    const int lc = (int)st->model->meta.do_lower_case;
+    se_scratch_t *sc = st->scratch;
+
+    while (i < input_len) {
+        uint8_t b = input[i];
+        if (b >= 0x80)
+            break;
+
+        if (i >= next_cancel_check) {
+            if (token_cancelled(st)) {
+                *ip = i;
+                se_error_set(st->err, SE_ERR_INTERNAL, "operation cancelled");
+                return SE_ERR_INTERNAL;
+            }
+            next_cancel_check = i + SE_ASCII_CANCEL_STRIDE;
+        }
+
+        se_ascii_class_t cls = ascii_class(b);
+
+        if (cls == SE_ASCII_WORD) {
+            if (st->segment_len >= sc->cps_cap) {
+                if (!grow_u32(&sc->cps, &sc->cps_cap,
+                              st->segment_len + ascii_word_reserve_len(input, input_len, i))) {
+                    *ip = i;
+                    return oom(st, "building token segment");
+                }
+            }
+            sc->cps[st->segment_len++] =
+                (lc && b >= 'A' && b <= 'Z') ? (uint32_t)(b + 32u) : (uint32_t)b;
+            i++;
+            continue;
+        }
+
+        if (cls == SE_ASCII_DROP) {
+            i++;
+            continue;
+        }
+
+        se_status_t rc = flush_segment(st, stop);
+        if (rc != SE_OK) {
+            *ip = i;
+            return rc;
+        }
+        if (*stop) {
+            *ip = i;
+            return SE_OK;
+        }
+
+        if (cls == SE_ASCII_PUNCT) {
+            uint32_t cp = b;
+            rc = append_wordpiece(st, &cp, 1, stop);
+            if (rc != SE_OK) {
+                *ip = i;
+                return rc;
+            }
+        }
+
+        i++;
+        if (*stop)
+            break;
+    }
+
+    *ip = i;
+    return SE_OK;
+}
+
 se_status_t se_tokenize(const se_model_t *model, se_scratch_t *sc, const uint8_t *input,
                         size_t input_len, uint32_t max_tokens, se_token_stats_t *stats,
                         se_error_t *err, volatile sig_atomic_t *cancelled) {
@@ -474,13 +566,24 @@ se_status_t se_tokenize(const se_model_t *model, se_scratch_t *sc, const uint8_t
             return SE_ERR_INTERNAL;
         }
 
+        int stop = 0;
+
+        if (input[i] < 0x80) {
+            se_status_t frc = tokenize_ascii_run(&st, input, input_len, &i, &stop);
+            if (frc != SE_OK)
+                return frc;
+            if (stop)
+                break;
+            if (i >= input_len)
+                break;
+        }
+
         uint32_t cp;
         if (!decode_one(input, input_len, &i, &cp)) {
             se_error_set(err, SE_ERR_INVALID_UTF8, "input is not valid UTF-8");
             return SE_ERR_INVALID_UTF8;
         }
 
-        int stop = 0;
         se_status_t rc = emit_cleaned(&st, cp, &stop);
         if (rc != SE_OK)
             return rc;

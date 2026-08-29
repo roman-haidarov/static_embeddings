@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <signal.h>
+#include <limits.h>
 
 #define SE_MAGIC          "SEMBv1\0\0"
 #define SE_MAGIC_LEN      8
@@ -26,6 +27,22 @@
 #define SE_EMPTY_RAISE       1u
 
 #define SE_SLOT_EMPTY 0xFFFFFFFFu
+#define SE_SIZE_MAX   ((size_t)-1)
+
+#ifndef SE_ENABLE_ALLOC_STATS
+#define SE_ENABLE_ALLOC_STATS 0
+#endif
+
+#define SE_ARRAY_LEN(a) (sizeof(a) / sizeof((a)[0]))
+
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+#define SE_STATIC_ASSERT(expr, name) _Static_assert((expr), #name)
+#else
+#define SE_STATIC_ASSERT_JOIN_INNER(a, b) a##b
+#define SE_STATIC_ASSERT_JOIN(a, b)       SE_STATIC_ASSERT_JOIN_INNER(a, b)
+#define SE_STATIC_ASSERT(expr, name) \
+    typedef char SE_STATIC_ASSERT_JOIN(se_static_assertion_, name)[(expr) ? 1 : -1]
+#endif
 
 enum {
     SE_OFF_MAGIC = 0,
@@ -199,6 +216,110 @@ typedef struct {
     char message[256];
 } se_error_t;
 
+typedef enum { SE_VECTOR_FORMAT_F32 = 1, SE_VECTOR_FORMAT_F16 = 2 } se_vector_format_t;
+
+typedef enum {
+    SE_F16_BACKEND_LUT = 0,
+    SE_F16_BACKEND_NEON_FP16 = 1,
+    SE_F16_BACKEND_F16C = 2
+} se_f16_backend_t;
+
+typedef enum {
+    SE_ALLOC_UNKNOWN = 0,
+    SE_ALLOC_SCRATCH,
+    SE_ALLOC_BATCH_INPUT,
+    SE_ALLOC_BATCH_OUTPUT,
+    SE_ALLOC_BATCH_STATS,
+    SE_ALLOC_BATCH_INDEX,
+    SE_ALLOC_TOKEN_IDS,
+    SE_ALLOC_TOPK_QUERY,
+    SE_ALLOC_TOPK_BEST,
+    SE_ALLOC_TOPK_MATRIX_COPY,
+    SE_ALLOC_FORMAT_VALIDATE,
+    SE_ALLOC_MODEL_FILE,
+    SE_ALLOC_CATEGORY_COUNT
+} se_alloc_category_t;
+
+typedef struct {
+    size_t current_bytes;
+    size_t peak_bytes;
+    size_t total_allocated_bytes;
+    size_t total_freed_bytes;
+    size_t alloc_count;
+    size_t realloc_count;
+    size_t free_count;
+} se_alloc_stats_t;
+
+typedef struct {
+    const float *q;
+    const void *m;
+    se_vector_format_t format;
+    size_t dim;
+    size_t rows;
+    long k;
+    size_t *best_idx;
+    float *best_score;
+    int cosine;
+    float inv_query_norm;
+    volatile sig_atomic_t cancelled;
+} se_topk_job_t;
+
+SE_STATIC_ASSERT(sizeof(se_vocab_slot_t) == 16, vocab_slot_size);
+SE_STATIC_ASSERT(sizeof(se_trie_node_t) == 16, trie_node_size);
+SE_STATIC_ASSERT(sizeof(se_trie_edge_t) == 8, trie_edge_size);
+SE_STATIC_ASSERT(sizeof(se_map_entry_t) == 24, map_entry_size);
+SE_STATIC_ASSERT(sizeof(se_range_t) == 8, range_size);
+
+static inline int se_checked_add_size(size_t a, size_t b, size_t *out) {
+    if (a > SE_SIZE_MAX - b)
+        return 0;
+    *out = a + b;
+    return 1;
+}
+
+static inline int se_checked_mul_size(size_t a, size_t b, size_t *out) {
+    if (a != 0 && b > SE_SIZE_MAX / a)
+        return 0;
+    *out = a * b;
+    return 1;
+}
+
+static inline int se_array_bytes(size_t count, size_t elem_size, size_t *out) {
+    return se_checked_mul_size(count, elem_size, out);
+}
+
+static inline size_t se_alloc_count(size_t count) {
+    return count ? count : 1;
+}
+
+static inline int se_alloc_bytes(size_t count, size_t elem_size, size_t *out) {
+    return se_checked_mul_size(se_alloc_count(count), elem_size, out);
+}
+
+static inline int se_next_capacity(size_t current, size_t need, size_t min_capacity, size_t *out) {
+    size_t next = current ? current : min_capacity;
+
+    if (next == 0)
+        next = 1;
+    while (next < need) {
+        if (next > SE_SIZE_MAX / 2)
+            return 0;
+        next *= 2;
+    }
+
+    *out = next;
+    return 1;
+}
+
+static inline int se_size_fits_long(size_t n) {
+    return n <= (size_t)LONG_MAX;
+}
+
+static inline int se_host_is_little_endian(void) {
+    const uint16_t one = 1;
+    return *((const uint8_t *)(const void *)&one) == 1;
+}
+
 #if defined(__GNUC__) || defined(__clang__)
 #define SE_PRINTF_FORMAT(fmt_index, first_arg) __attribute__((format(printf, fmt_index, first_arg)))
 #else
@@ -207,6 +328,28 @@ typedef struct {
 
 void se_error_clear(se_error_t *err);
 void se_error_set(se_error_t *err, se_status_t status, const char *fmt, ...) SE_PRINTF_FORMAT(3, 4);
+
+const char *se_alloc_category_name(se_alloc_category_t category);
+void se_alloc_stats_reset(void);
+void se_alloc_stats_snapshot(se_alloc_stats_t out[SE_ALLOC_CATEGORY_COUNT]);
+
+#if SE_ENABLE_ALLOC_STATS
+void *se_alloc_stats_malloc(se_alloc_category_t category, size_t bytes);
+void *se_alloc_stats_calloc(se_alloc_category_t category, size_t count, size_t elem_size);
+void *se_alloc_stats_realloc(se_alloc_category_t category, void *ptr, size_t bytes);
+void se_alloc_stats_free(void *ptr);
+
+#define se_malloc(category, bytes) se_alloc_stats_malloc((category), (bytes))
+#define se_calloc(category, count, elem_size) \
+    se_alloc_stats_calloc((category), (count), (elem_size))
+#define se_realloc(category, ptr, bytes) se_alloc_stats_realloc((category), (ptr), (bytes))
+#define se_free(ptr)                     se_alloc_stats_free((ptr))
+#else
+#define se_malloc(category, bytes)            malloc((bytes))
+#define se_calloc(category, count, elem_size) calloc((count), (elem_size))
+#define se_realloc(category, ptr, bytes)      realloc((ptr), (bytes))
+#define se_free(ptr)                          free((ptr))
+#endif
 
 se_status_t se_model_open(se_model_t *model, const char *path, se_error_t *err);
 void se_model_close(se_model_t *model);
@@ -262,5 +405,21 @@ se_status_t se_embed_ids(const se_model_t *model, se_scratch_t *scratch, const u
 
 void se_l2_normalize(float *vec, uint32_t dim);
 size_t se_model_warmup(const se_model_t *model);
+
+size_t se_vector_format_element_bytes(se_vector_format_t format);
+uint16_t se_float_to_f16_bits(float value);
+float se_f16_bits_to_float(uint16_t half);
+void se_write_f16le(uint8_t *dst, float value);
+float se_read_f16le(const uint8_t *src);
+void se_encode_f16_from_floats(uint8_t *dst, const float *src, size_t count);
+void se_decode_f16_to_floats(float *dst, const uint8_t *src, size_t count);
+void se_select_f16_backend(void);
+se_f16_backend_t se_current_f16_backend(void);
+
+float se_dot_product_f32(const float *q, const float *row, size_t dim);
+float se_dot_and_row_sq_f32(const float *q, const float *row, size_t dim, float *row_sq_out);
+float se_dot_product_f16(const float *q, const uint8_t *row, size_t dim);
+float se_dot_and_row_sq_f16(const float *q, const uint8_t *row, size_t dim, float *row_sq_out);
+void *se_topk_execute(void *arg);
 
 #endif

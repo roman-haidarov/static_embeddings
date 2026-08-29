@@ -24,6 +24,9 @@ end
 
 $srcs = %w[
   static_embeddings.c
+  se_alloc_stats.c
+  se_f16.c
+  se_topk.c
   se_format.c
   se_unicode.c
   se_tokenizer.c
@@ -40,5 +43,6 @@ end
 
 $CFLAGS += " -O3 -std=gnu99 -fvisibility=hidden"
 $CFLAGS += " -Wall -Wextra -Wno-unused-parameter"
+$defs << "-DSE_ENABLE_ALLOC_STATS=1" if ENV["STATIC_EMBEDDINGS_ALLOC_STATS"] == "1"
 
 create_makefile("static_embeddings/static_embeddings")

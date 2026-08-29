@@ -1,5 +1,126 @@
 # Changelog
 
+## 0.1.2 (unreleased)
+
+A tokenizer correctness fix, the ASCII fast path it made safe to write, and an
+optional build that accounts for the runtime's own C heap.
+
+External parity against `model2vec.StaticModel` has **not** been re-run for this
+version. The DEL fix below changes token ids for any input containing `U+007F`,
+so the 0.1.1 audit record no longer covers the shipping runtime. See
+`docs/MODEL_AUDIT.md`; that re-run is the release blocker.
+
+### Fixed
+
+- **`U+007F DEL` was not treated as a control character.** `is_control()`
+  matched `cp < 0x20` only, so DEL survived `clean_text` and stayed a word byte
+  while the reference normalizer drops it. The effect was not one token: the
+  word carrying DEL fell out of the vocabulary and collapsed to `[UNK]`.
+  A 20 000-case differential fuzz against `StaticEmbeddings::Reference` produced
+  4 084 mismatches before the fix and 0 after; an exhaustive sweep of
+  `0x00..0x7F` shows DEL was the only divergent ASCII byte.
+
+- **`embed_batch(format: :f16)` allocated a second output buffer.** The f32
+  batch buffer was encoded into a freshly allocated half buffer, so an f16 call
+  peaked at 1.5x the f32 output and cost more transient C heap than f32 for the
+  same work. It now encodes in place. Output is byte-identical; on 5000 x 512
+  the transient peak drops from 16.4 MB to 11.3 MB, the same peak the f32 call
+  has. Throughput is unchanged: the run-to-run spread on that sample is wider
+  than any difference the change makes.
+
+### Added
+
+- **ASCII fast path in the tokenizer.** For `cp < 0x80` the normalizer chain
+  resolves the CJK, NFD, combining-mark and case-folding branches identically
+  every time, so ASCII runs now go through a 128-entry classification table and
+  reserve their codepoint buffer once per word instead of once per character.
+  Output is unchanged: the token-stream digest over 20 000 fuzz cases is
+  identical with and without it. Roughly 1.7x on `tokenize` and 1.2x on `embed`
+  for short English text, 2x on `tokenize` with `max_tokens: false`. Non-ASCII
+  input is unaffected.
+
+- **`test/ascii_parity_test.rb`.** Exhaustive `0x00..0x7F` sweep in six
+  contexts, boundary codepoints across the ASCII/Unicode edge, deterministic
+  differential fuzz against `Reference` (`FUZZ_N`, `FUZZ_SEED`), truncation
+  boundaries, and DEL walked across the prefix window so the `embed` path is
+  covered and not just `tokenize`. Four of its cases fail on 0.1.1.
+
+- **`test/validate_encoding_test.rb`** and verify coverage in
+  `test/format_test.rb`: mode agreement on valid input, invalid bytes inside
+  and past the window, cached-broken coderange, non-UTF-8 encodings, batch
+  index reporting, tamper detection, truncated and foreign files, and an
+  allocation bound proving `verify` does not hold the file in memory.
+
+- **`test/cancellation_timing_test.rb`.** Measures how far past a `Timeout`
+  deadline `embed` keeps running. It is excluded from `rake test` because it is
+  timing-sensitive; run it with `rake cancellation_timing`.
+
+- **`validate_encoding: :full | :prefix`** on `embed`, `embed_batch`,
+  `embed_with_stats` and `tokenize`. `embed` has to establish that its `String`
+  is valid UTF-8, and when Ruby has not computed the coderange yet that scan is
+  O(total bytes) and runs before the prefix window is chosen — so the
+  large-input path was not actually bounded on a freshly read document.
+  `:prefix` skips the up-front scan and lets the tokenizer validate the bytes it
+  reads: 442 µs to 78 µs on a 3 MB string, against 71 µs for the same string
+  with its coderange cached. `:full` stays the default, because `:prefix`
+  changes behaviour — invalid bytes past the truncation window are no longer
+  seen. A coderange Ruby has already computed is honoured in both modes.
+
+- **Optional C allocation accounting.** Building with
+  `STATIC_EMBEDDINGS_ALLOC_STATS=1` wraps the runtime's own allocations and
+  exposes per-category bytes and counts, which the sample harness prints as
+  `c_alloc.<category>.<metric>`. Default builds do not define the internal
+  methods and do not pay for the counters. See `docs/PERFORMANCE.md`.
+
+- **CI jobs `parity_fuzz`, `timing`, `alloc_stats` and `windows_loader`,** plus
+  a sanitizer build of the instrumented allocator inside the existing `memory`
+  job. The Windows job cross-compiles with mingw-w64 and runs the result under
+  wine, because that branch of `se_model_open` is the one path no other job
+  builds. `alloc_stats` is separate because it has to `rake clobber` first, and
+  clobber removes `tmp/`.
+
+### Changed
+
+- **The ASCII fast path checks the cancellation flag** on the same cadence as
+  the main loop. A run of ASCII bytes is consumed inside one C call, so without
+  the check a `max_tokens: false` call on a large document ignored its deadline
+  until the whole document was tokenized: 0.33 s against a 0.05 s `Timeout` on a
+  16 MB input, versus 0.05 s now.
+
+- **`ext/static_embeddings/static_embeddings.c` was split.** The f16 codec and
+  kernels moved to `se_f16.c`, the top-k kernels to `se_topk.c`, and the
+  allocation counters live in `se_alloc_stats.c`. Shared overflow-checked size
+  helpers, `static_assert`s on the mmapped struct layouts, and an explicit
+  rejection of big-endian hosts moved into `se_internal.h`.
+
+- **`Format.verify` streams the file.** It read the whole model and then
+  duplicated it to zero the checksum field, so verifying a 135 MB artifact
+  needed roughly 270 MB of transient `String` before hashing started. Peak is
+  now one 1 MiB chunk: measured on a 62 MB model, 433 ms and 280 MB of peak RSS
+  down to 249 ms and 30 MB.
+
+- **Windows maps the model instead of reading it into the heap.** The POSIX
+  loader has always used `mmap`; Windows did `fopen` plus `fread` into a
+  private allocation, so every process paid a full read before the first query
+  and a private copy of the whole model. It now uses
+  `CreateFileMapping`/`MapViewOfFile`, with the old read path kept as a
+  fallback for filesystems that refuse to map. Verified by cross-compiling with
+  mingw-w64 and running under wine against a real `.semb`: same `map_size`,
+  same vectors as the POSIX build, and `mapped=1`.
+
+- **Throughput figures separate logical from processed bytes.**
+  `tools/benchmark.rb` reports how many texts were truncated and refuses a
+  ns/byte figure when truncation makes the two differ; the large-input samples
+  print a measured `processed_input_mb_per_sec` alongside the logical one.
+
+- **`samples/run_all.sh` captures `rake test`** into `00_test.log`, so a run
+  directory can back both "samples green" and "tests green". `TEST=0` skips it.
+
+- **Documentation.** The README no longer implies `embed` is constant-time in
+  input size (the prefix window bounds the tokenizer, not the UTF-8 validity
+  scan) and no longer claims `f16` is faster, since this repository's own
+  samples show it winning on x86-64 F16C and losing on M1 Pro.
+
 ## 0.1.1 (unreleased)
 
 Safety and correctness release. Everything here was found by re-reviewing 0.1.0

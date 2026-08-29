@@ -7,7 +7,7 @@ require "static_embeddings"
 module StaticEmbeddingsSample
   module_function
 
-  NATIVE_GREP = "StaticEmbeddings|static_embeddings|se_|model_embed|embed_one|embed_batch|batch_execute|topk_execute|warmup_execute|wordpiece|normalize|vocab|hash|tokenize|l2|cosine|unblock_cancel"
+  NATIVE_GREP = "StaticEmbeddings|static_embeddings|se_|model_embed|embed_one|embed_batch|batch_execute|se_topk_execute|warmup_execute|wordpiece|normalize|vocab|hash|tokenize|l2|cosine|unblock_cancel"
 
   def root
     @root ||= File.expand_path("../..", __dir__)
@@ -43,6 +43,35 @@ module StaticEmbeddingsSample
 
   def gc_delta(before, after)
     before.each_with_object({}) { |(key, value), out| out[key] = after.fetch(key) - value }
+  end
+
+  def alloc_stats_enabled?
+    StaticEmbeddings.respond_to?(:__alloc_stats__) &&
+      StaticEmbeddings.respond_to?(:__alloc_stats_reset__)
+  end
+
+  def alloc_stats_reset
+    StaticEmbeddings.__alloc_stats_reset__ if alloc_stats_enabled?
+  end
+
+  def alloc_stats_snapshot
+    return nil unless alloc_stats_enabled?
+
+    StaticEmbeddings.__alloc_stats__
+  end
+
+  def print_alloc_stats_table(stats, prefix: "c_alloc")
+    return if stats.nil?
+
+    stats.each do |category, values|
+      next if values.values.all?(&:zero?)
+
+      values.each { |key, value| puts "#{prefix}.#{category}.#{key}=#{value}" }
+    end
+  end
+
+  def print_alloc_stats(prefix: "c_alloc")
+    print_alloc_stats_table(alloc_stats_snapshot, prefix: prefix)
   end
 
   def candidate_model_paths
@@ -92,6 +121,58 @@ module StaticEmbeddingsSample
 
     expected = rows * model.dim * bytes_per_component(format)
     raise "#{label}: expected #{expected} bytes for format=#{format_label(format)}, got #{blob.bytesize}" unless blob.bytesize == expected
+  end
+
+  def print_input_throughput(name:, bytes:, count:, elapsed:, truncation_active: false,
+                             processed_bytes: nil)
+    puts "#{name}=#{format('%.3f', (count * bytes) / elapsed / 1_000_000.0)}"
+    puts "input_bytes_metric=logical"
+    return unless truncation_active
+
+    puts "logical_input_bytes=#{bytes}"
+    if processed_bytes
+      puts "processed_input_bytes=#{processed_bytes}"
+      puts "processed_input_mb_per_sec=" \
+           "#{format('%.3f', (count * processed_bytes) / elapsed / 1_000_000.0)}"
+      puts "input_metric_note=quote_processed_input_mb_per_sec"
+    else
+      puts "processed_input_mb_per_sec=unknown"
+      puts "input_metric_note=logical_input_mb_per_sec_can_overstate_processed_bytes"
+    end
+  end
+
+  def processed_input_bytes(model, text, format: embedding_format)
+    return nil unless model.embed_with_stats(text, format: format)[:truncated]
+
+    target = model.embed(text, format: format)
+    low = 0
+    high = text.bytesize
+
+    while high - low > 1
+      probe = codepoint_boundary_at(text, low + ((high - low) / 2))
+      probe = codepoint_boundary_at(text, probe - 1, :back) if probe >= high
+      break if probe <= low || probe >= high
+
+      if model.embed(text.byteslice(0, probe), format: format) == target
+        high = probe
+      else
+        low = probe
+      end
+    end
+
+    return nil if high < model.embed_with_stats(text, format: format)[:token_count]
+
+    high
+  end
+
+  def codepoint_boundary_at(text, offset, direction = :forward)
+    offset = 0 if offset.negative?
+    limit = text.bytesize
+    return limit if offset >= limit
+
+    step = direction == :back ? -1 : 1
+    offset += step while offset.positive? && offset < limit && (text.getbyte(offset) & 0xC0) == 0x80
+    offset
   end
 
   def result_dir
@@ -168,9 +249,11 @@ module StaticEmbeddingsSample
     GC.start
     disabled = gc_disabled?
     GC.disable if disabled
+    alloc_stats_reset
     before_gc = gc_snapshot
     count, elapsed, last = run_loop(duration) { yield }
     after_gc = gc_snapshot
+    print_alloc_stats
     [count, elapsed, last, gc_delta(before_gc, after_gc).merge(gc_disabled: disabled)]
   ensure
     GC.enable if disabled

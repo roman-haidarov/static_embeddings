@@ -1,12 +1,24 @@
 # Model Audit
 
-This document records the trust and parity status of converted `.semb` models.
-A converted production model is accepted only after parity against the upstream
-Python `model2vec.StaticModel` implementation is recorded here.
+A converted model is trusted only after parity against upstream
+`model2vec.StaticModel` is recorded here. An audit record covers one `.semb`
+file **and** one runtime version: changing the tokenizer, normalizer, prefix
+window, pooling, output normalization or the oracle's corpus invalidates the
+runtime half of it even though the file bytes are untouched.
 
 ## potion-retrieval-32m
 
-Status: audited / accepted
+| runtime | parity | note |
+|---|---|---|
+| 0.1.1 | `parity OK`, recorded below | superseded |
+| 0.1.2 | **not re-run** | required before release |
+
+0.1.2 changed `is_control()`, which changes token ids for any input containing
+`U+007F`. `StaticEmbeddings::Reference` cannot settle whether the new behaviour
+matches HuggingFace, because it is an implementation twin of the C runtime
+written in this repository. Only the oracle can, and the oracle now carries DEL
+and control-character rows it did not have when the result below was recorded —
+so `rows=28` would itself be evidence of a stale run.
 
 Source model:
 
@@ -14,11 +26,10 @@ Source model:
 - Oracle implementation: `model2vec.StaticModel.from_pretrained`
 - Python package: `model2vec 0.9.0`
 - Oracle file: `tmp/model2vec_oracle.json`
-- Oracle rows: `28`
+- Oracle rows in this recorded run: `28`
 - Oracle dimension: `512`
 - Oracle max length: `512`
-- Runtime checked with: `static_embeddings 0.1.1`
-- Runtime source note: re-run parity after changing tokenizer, normalizer, prefix-window, pooling, or output-normalization code.
+- Runtime at time of this record: `static_embeddings 0.1.1`
 
 Converted `.semb`:
 
@@ -58,4 +69,6 @@ Decision:
 - Unknown-word behavior: pass
 - Long input / truncation behavior: pass
 
-This converted model is accepted for runtime and benchmark use.
+Accepted for runtime and benchmark use **under 0.1.1**. The `.semb` file is
+unchanged and its SHA256 still matches; what expired is the runtime half of the
+record.

@@ -5,20 +5,22 @@
 ```bash
 bundle install
 bundle exec rake            # compile + fixtures + test
-bundle exec rake demo_model # build the tiny model shipped in the gem
+bundle exec rake demo_model # tiny synthetic model, checkout only
 ```
 
-## 2. Try it without any model download
+## 2. Try it without downloading a model
 
 ```ruby
 require "static_embeddings"
 
-model = StaticEmbeddings.load_builtin   # checkout only, after bundle exec rake demo_model
+model = StaticEmbeddings.load_builtin
 
 model.embed_array("hello world")
 model.tokenize("Привет, мир!")
 model.embed_with_stats("hello world")
 ```
+
+The demo model is a fixture, not a quality baseline.
 
 ## 3. Convert a real model
 
@@ -27,9 +29,9 @@ git lfs clone https://huggingface.co/minishlab/potion-retrieval-32M
 bundle exec static_embeddings convert ./potion-retrieval-32M --id potion-retrieval-32m
 ```
 
-The converter will refuse the model if its tokenizer is outside the supported
-profile. That refusal is the feature: read `docs/MODEL_AUDIT.md` before
-working around it.
+If the converter refuses the model, its tokenizer is outside the supported
+profile. That refusal is the feature; read `docs/MODEL_AUDIT.md` before working
+around it.
 
 ## 4. Wire it into retrieval
 
@@ -46,19 +48,17 @@ db.transaction do
 end
 
 # query
-query_vector = model.embed(question, format: :f16) # 512-dim model => 1024-byte blob
+query_vector = model.embed(question, format: :f16)
 ```
 
+`format: :f32` is the default and returns `dim * 4` bytes; `format: :f16`
+returns `dim * 2` for compact storage. Keep one format per index.
 
-`format: :f32` is the default and returns `dim * 4` bytes. `format: :f16`
-returns `dim * 2` bytes for compact storage. Keep one format per index/table.
+Offline indexing scales by running more application workers. The runtime
+deliberately does not expose internal `threads:` parallelism.
 
-Run multiple application workers/jobs when offline indexing should use more
-than one CPU core. The runtime intentionally does not expose internal
-`threads:` parallelism.
-
-For anything real, fuse this with BM25 (SQLite FTS5 gives it to you for free)
-via Reciprocal Rank Fusion — dense and lexical retrieval miss different things,
+For anything real, fuse this with BM25 — SQLite FTS5 gives it to you for free —
+via Reciprocal Rank Fusion. Dense and lexical retrieval miss different things,
 and the combination recovers most of the quality gap against a transformer
 encoder.
 
@@ -69,5 +69,5 @@ stats = model.embed_with_stats(text)
 ratio = stats[:unk_count].to_f / [stats[:token_count], 1].max
 ```
 
-An English model fed Russian returns a valid vector built from nothing. This
-is the single most likely way to get a silently bad index.
+An English model fed Russian returns a valid vector built from nothing. This is
+the single most likely way to get a silently bad index.

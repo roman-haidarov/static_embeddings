@@ -1,4 +1,6 @@
 require_relative "test_helper"
+require "tmpdir"
+require "fileutils"
 
 class FormatTest < Minitest::Test
   def setup
@@ -8,6 +10,45 @@ class FormatTest < Minitest::Test
   def test_checksum_verifies
     result = StaticEmbeddings.verify(@path)
     assert result[:ok], "checksum mismatch: #{result.inspect}"
+    assert_equal result[:expected], result[:stored]
+  end
+
+  def test_verify_detects_a_flipped_byte_in_the_matrix
+    Dir.mktmpdir do |dir|
+      tampered = File.join(dir, "tampered.semb")
+      FileUtils.cp(@path, tampered)
+      File.open(tampered, "r+b") do |file|
+        file.seek(-64, IO::SEEK_END)
+        byte = file.read(1)
+        file.seek(-1, IO::SEEK_CUR)
+        file.write([byte.getbyte(0) ^ 0xFF].pack("C"))
+      end
+
+      result = StaticEmbeddings.verify(tampered)
+      refute result[:ok], "a flipped matrix byte was not detected"
+      refute_equal result[:expected], result[:stored]
+    end
+  end
+
+  def test_verify_rejects_truncated_and_foreign_files
+    Dir.mktmpdir do |dir|
+      short = File.join(dir, "short.semb")
+      File.binwrite(short, "x" * 16)
+      assert_raises(StaticEmbeddings::InvalidModelError) { StaticEmbeddings.verify(short) }
+
+      foreign = File.join(dir, "foreign.semb")
+      File.binwrite(foreign, "Z" * 1024)
+      assert_raises(StaticEmbeddings::InvalidModelError) { StaticEmbeddings.verify(foreign) }
+    end
+  end
+
+  def test_verify_does_not_hold_the_file_in_memory
+    before = GC.stat(:total_allocated_objects)
+    StaticEmbeddings.verify(@path)
+    allocated = GC.stat(:total_allocated_objects) - before
+
+    assert_operator allocated, :<, 1_000,
+                    "verify allocated #{allocated} objects; it should stream"
   end
 
   def test_metadata_round_trip

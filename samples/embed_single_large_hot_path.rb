@@ -8,6 +8,7 @@ sleep_before_hot_loop = StaticEmbeddingsSample.env_float("SLEEP_BEFORE_HOT_LOOP"
 preheat_iterations = StaticEmbeddingsSample.env_int("PREHEAT_ITERATIONS", 2)
 input_bytes = StaticEmbeddingsSample.env_int("INPUT_BYTES", 3_000_000)
 text = StaticEmbeddingsSample.text_bytes!(StaticEmbeddingsSample.ascii_rag_text(input_bytes), "input")
+processed_bytes = StaticEmbeddingsSample.processed_input_bytes(model, text, format: format)
 native_grep = "StaticEmbeddings|static_embeddings|model_embed|embed_one|se_embed_one|se_tokenize|normalize|append_wordpiece|wordpiece|se_vocab_lookup|se_hash_bytes|se_l2_normalize|unblock_cancel"
 
 StaticEmbeddingsSample.preheat(preheat_iterations) do
@@ -25,6 +26,7 @@ StaticEmbeddingsSample.print_header(
   native_grep: native_grep,
   extra: {
     input_bytes: text.bytesize,
+    processed_bytes: processed_bytes || text.bytesize,
     format: StaticEmbeddingsSample.format_label(format),
     bytes_per_component: StaticEmbeddingsSample.bytes_per_component(format),
     expected_hot_symbols: [
@@ -44,7 +46,14 @@ puts "count=#{count}"
 puts "elapsed=#{format('%.6f', elapsed)}"
 puts "ops_per_sec=#{format('%.6f', count / elapsed)}"
 puts "sec_per_op=#{format('%.6f', elapsed / [count, 1].max)}"
-puts "logical_input_mb_per_sec=#{format('%.3f', (count * text.bytesize) / elapsed / 1_000_000.0)}"
 puts "truncation_active=true"
+StaticEmbeddingsSample.print_input_throughput(
+  name: "logical_input_mb_per_sec",
+  bytes: text.bytesize,
+  count: count,
+  elapsed: elapsed,
+  truncation_active: true,
+  processed_bytes: processed_bytes
+)
 puts "output_bytes=#{last&.bytesize}"
 puts "gc_delta=#{gc_delta}"

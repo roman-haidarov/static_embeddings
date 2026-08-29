@@ -15,25 +15,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#if defined(__ARM_NEON) || defined(__ARM_NEON__)
-#include <arm_neon.h>
-#define SE_HAVE_NEON 1
-#if defined(__aarch64__)
-#define SE_HAVE_NEON_FP16 1
-#endif
-#elif defined(__SSE__)
-#include <xmmintrin.h>
-#define SE_HAVE_SSE 1
-#endif
-
-#if defined(__x86_64__) || defined(__i386__)
-#if defined(__GNUC__) || defined(__clang__)
-#include <cpuid.h>
-#include <immintrin.h>
-#define SE_HAVE_X86_F16C_TARGET 1
-#endif
-#endif
-
 #include "se_internal.h"
 
 #if defined(__GNUC__) || defined(__clang__)
@@ -50,29 +31,6 @@
 #define SE_PREFIX_MIN_BYTES          4096
 #define SE_PREFIX_MAX_BYTES          65536
 #define SE_PREFIX_BACKSCAN_BYTES     8192
-#define SE_SIZE_MAX                  ((size_t)-1)
-
-typedef enum { SE_VECTOR_FORMAT_F32 = 1, SE_VECTOR_FORMAT_F16 = 2 } se_vector_format_t;
-
-typedef enum {
-    SE_F16_BACKEND_LUT = 0,
-    SE_F16_BACKEND_NEON_FP16 = 1,
-    SE_F16_BACKEND_F16C = 2
-} se_f16_backend_t;
-
-static se_f16_backend_t se_f16_backend = SE_F16_BACKEND_LUT;
-
-#if !defined(SE_HAVE_NEON_FP16)
-#define SE_NEED_F16_LUT 1
-/* 256 KB of BSS, and only for builds that can fall back to it. It is populated
- * lazily by select_f16_backend, so an x86 machine with F16C never touches these
- * pages either. AArch64 does not compile the table at all. */
-static float se_f16_lut[65536];
-#endif
-
-static size_t vector_format_element_bytes(se_vector_format_t format) {
-    return format == SE_VECTOR_FORMAT_F16 ? 2u : sizeof(float);
-}
 
 static int string_equals_literal(VALUE str, const char *lit) {
     size_t n = strlen(lit);
@@ -101,147 +59,6 @@ static se_vector_format_t resolve_vector_format(VALUE opt) {
              opt);
 }
 
-static void write_u16le(uint8_t *dst, uint16_t v) {
-    dst[0] = (uint8_t)(v & 0xffu);
-    dst[1] = (uint8_t)(v >> 8);
-}
-
-static uint16_t read_u16le(const uint8_t *src) {
-    return (uint16_t)src[0] | ((uint16_t)src[1] << 8);
-}
-
-static uint16_t float_to_f16_bits(float value) {
-    uint32_t bits;
-    memcpy(&bits, &value, sizeof(bits));
-
-    uint32_t sign = (bits >> 16) & 0x8000u;
-    uint32_t exp = (bits >> 23) & 0xffu;
-    uint32_t mant = bits & 0x7fffffu;
-
-    if (exp == 0xffu) {
-        if (mant == 0)
-            return (uint16_t)(sign | 0x7c00u);
-        mant >>= 13;
-        return (uint16_t)(sign | 0x7c00u | mant | (mant == 0));
-    }
-
-    int32_t half_exp = (int32_t)exp - 127 + 15;
-    if (half_exp >= 31)
-        return (uint16_t)(sign | 0x7c00u);
-
-    if (half_exp <= 0) {
-        if (half_exp < -10)
-            return (uint16_t)sign;
-        mant |= 0x800000u;
-        uint32_t shift = (uint32_t)(14 - half_exp);
-        uint32_t rounded = (mant + (1u << (shift - 1))) >> shift;
-        return (uint16_t)(sign | rounded);
-    }
-
-    mant += 0x1000u;
-    if (mant & 0x800000u) {
-        mant = 0;
-        half_exp++;
-        if (half_exp >= 31)
-            return (uint16_t)(sign | 0x7c00u);
-    }
-
-    return (uint16_t)(sign | ((uint32_t)half_exp << 10) | (mant >> 13));
-}
-
-static float f16_bits_to_float(uint16_t half) {
-    uint32_t sign = ((uint32_t)half & 0x8000u) << 16;
-    uint32_t exp = ((uint32_t)half >> 10) & 0x1fu;
-    uint32_t mant = (uint32_t)half & 0x03ffu;
-    uint32_t bits;
-
-    if (exp == 0) {
-        if (mant == 0) {
-            bits = sign;
-        } else {
-            exp = 1;
-            while ((mant & 0x0400u) == 0) {
-                mant <<= 1;
-                exp--;
-            }
-            mant &= 0x03ffu;
-            bits = sign | ((exp + (127 - 15)) << 23) | (mant << 13);
-        }
-    } else if (exp == 31) {
-        bits = sign | 0x7f800000u | (mant << 13);
-    } else {
-        bits = sign | ((exp + (127 - 15)) << 23) | (mant << 13);
-    }
-
-    float value;
-    memcpy(&value, &bits, sizeof(value));
-    return value;
-}
-
-static void encode_f16_from_floats(uint8_t *dst, const float *src, size_t count) {
-    for (size_t i = 0; i < count; i++)
-        write_u16le(dst + i * 2, float_to_f16_bits(src[i]));
-}
-
-static void decode_f16_to_floats(float *dst, const uint8_t *src, size_t count) {
-    for (size_t i = 0; i < count; i++)
-        dst[i] = f16_bits_to_float(read_u16le(src + i * 2));
-}
-
-#if defined(SE_NEED_F16_LUT)
-static void init_f16_lut(void) {
-    for (uint32_t i = 0; i <= 0xffffu; i++)
-        se_f16_lut[i] = f16_bits_to_float((uint16_t)i);
-}
-#endif
-
-#if defined(SE_HAVE_X86_F16C_TARGET)
-#ifndef bit_OSXSAVE
-#define bit_OSXSAVE (1u << 27)
-#endif
-#ifndef bit_AVX
-#define bit_AVX (1u << 28)
-#endif
-#ifndef bit_F16C
-#define bit_F16C (1u << 29)
-#endif
-
-static int detect_x86_f16c(void) {
-    unsigned int eax = 0, ebx = 0, ecx = 0, edx = 0;
-    if (!__get_cpuid(1, &eax, &ebx, &ecx, &edx))
-        return 0;
-    if ((ecx & bit_OSXSAVE) == 0 || (ecx & bit_AVX) == 0 || (ecx & bit_F16C) == 0)
-        return 0;
-
-    uint32_t xcr0_lo = 0, xcr0_hi = 0;
-#if defined(_MSC_VER)
-    return 0;
-#else
-    __asm__ volatile("xgetbv" : "=a"(xcr0_lo), "=d"(xcr0_hi) : "c"(0));
-    (void)xcr0_hi;
-    return (xcr0_lo & 0x6u) == 0x6u;
-#endif
-}
-#endif
-
-static int checked_add_size(size_t a, size_t b, size_t *out) {
-    if (a > SE_SIZE_MAX - b)
-        return 0;
-    *out = a + b;
-    return 1;
-}
-
-static int checked_mul_size(size_t a, size_t b, size_t *out) {
-    if (a != 0 && b > SE_SIZE_MAX / a)
-        return 0;
-    *out = a * b;
-    return 1;
-}
-
-static int size_fits_long(size_t n) {
-    return n <= (size_t)LONG_MAX;
-}
-
 static VALUE mStaticEmbeddings;
 static VALUE cModel;
 static VALUE cFiber;
@@ -266,6 +83,9 @@ static ID id_unk_count;
 static ID id_truncated;
 static ID id_dim;
 static ID id_allow_unfrozen;
+static ID id_validate_encoding;
+static ID id_full;
+static ID id_prefix;
 
 RUBY_FUNC_EXPORTED void Init_static_embeddings(void);
 
@@ -327,7 +147,24 @@ static void raise_se(const se_error_t *err) {
     rb_raise(error_class_for(err->status), "%s", err->message);
 }
 
-static void check_text_encoding_at(VALUE str, long index) {
+static VALUE se_simd_backend(VALUE self) {
+    (void)self;
+    switch (se_current_f16_backend()) {
+    case SE_F16_BACKEND_NEON_FP16:
+        return rb_str_new_cstr("neon-fp16");
+    case SE_F16_BACKEND_F16C:
+        return rb_str_new_cstr("f16c");
+    default:
+        return rb_str_new_cstr("lut");
+    }
+}
+
+typedef enum {
+    SE_VALIDATE_ENCODING_FULL = 0,
+    SE_VALIDATE_ENCODING_PREFIX = 1
+} se_encoding_validation_t;
+
+static void check_text_encoding_mode(VALUE str, long index, se_encoding_validation_t mode) {
     rb_encoding *enc = rb_enc_get(str);
     if (enc != utf8_encoding && enc != rb_usascii_encoding()) {
         if (index >= 0) {
@@ -338,7 +175,14 @@ static void check_text_encoding_at(VALUE str, long index) {
         rb_raise(eEncodingError, "expected UTF-8 or US-ASCII, got %s (transcode explicitly)",
                  rb_enc_name(enc));
     }
-    int cr = rb_enc_str_coderange(str);
+
+    int cr = ENC_CODERANGE(str);
+    if (cr == ENC_CODERANGE_UNKNOWN) {
+        if (mode == SE_VALIDATE_ENCODING_PREFIX)
+            return;
+        cr = rb_enc_str_coderange(str);
+    }
+
     if (cr != ENC_CODERANGE_VALID && cr != ENC_CODERANGE_7BIT) {
         if (index >= 0)
             rb_raise(eEncodingError, "input[%ld]: string is not valid %s", index, rb_enc_name(enc));
@@ -346,8 +190,19 @@ static void check_text_encoding_at(VALUE str, long index) {
     }
 }
 
-static void check_text_encoding(VALUE str) {
-    check_text_encoding_at(str, -1);
+static se_encoding_validation_t resolve_encoding_validation(VALUE opt) {
+    if (opt == Qundef || NIL_P(opt))
+        return SE_VALIDATE_ENCODING_FULL;
+
+    if (SYMBOL_P(opt)) {
+        ID sym = SYM2ID(opt);
+        if (sym == id_full)
+            return SE_VALIDATE_ENCODING_FULL;
+        if (sym == id_prefix)
+            return SE_VALIDATE_ENCODING_PREFIX;
+    }
+
+    rb_raise(rb_eArgError, "validate_encoding: must be :full or :prefix");
 }
 
 typedef struct {
@@ -719,12 +574,13 @@ static VALUE text_at(const text_source_t *src, size_t i) {
     return RARRAY_AREF(src->snapshot, (long)i);
 }
 
-static VALUE snapshot_texts(VALUE texts, int is_array, size_t count) {
+static VALUE snapshot_texts(VALUE texts, int is_array, size_t count,
+                            se_encoding_validation_t validation) {
     VALUE snapshot = rb_ary_new_capa((long)count);
     for (size_t i = 0; i < count; i++) {
         VALUE s = is_array ? rb_ary_entry(texts, (long)i) : texts;
         Check_Type(s, T_STRING);
-        check_text_encoding_at(s, is_array ? (long)i : -1);
+        check_text_encoding_mode(s, is_array ? (long)i : -1, validation);
         rb_ary_push(snapshot, s);
     }
     return snapshot;
@@ -737,24 +593,26 @@ static int build_input_indexed(const text_source_t *src, const size_t *indices,
 
     size_t total = 0;
     for (size_t j = 0; j < count; j++) {
-        if (!checked_add_size(total, copy_lens[j], &total))
+        if (!se_checked_add_size(total, copy_lens[j], &total))
             return 0;
     }
 
-    size_t offsets_bytes;
-    size_t lengths_bytes;
-    size_t meta_bytes;
-    size_t allocation_bytes;
-    size_t slots = count ? count : 1;
+    size_t offsets_bytes = 0;
+    size_t lengths_bytes = 0;
+    size_t meta_bytes = 0;
+    size_t allocation_bytes = 0;
+    size_t payload_bytes = total;
+    size_t malloc_bytes = 0;
 
-    if (!checked_mul_size(slots, sizeof(size_t), &offsets_bytes) ||
-        !checked_mul_size(slots, sizeof(size_t), &lengths_bytes) ||
-        !checked_add_size(offsets_bytes, lengths_bytes, &meta_bytes) ||
-        !checked_add_size(meta_bytes, total ? total : 1, &allocation_bytes)) {
+    if (!se_array_bytes(count, sizeof(size_t), &offsets_bytes) ||
+        !se_array_bytes(count, sizeof(size_t), &lengths_bytes) ||
+        !se_checked_add_size(offsets_bytes, lengths_bytes, &meta_bytes) ||
+        !se_checked_add_size(meta_bytes, payload_bytes, &allocation_bytes) ||
+        !se_alloc_bytes(allocation_bytes, 1u, &malloc_bytes)) {
         return 0;
     }
 
-    uint8_t *allocation = (uint8_t *)malloc(allocation_bytes);
+    uint8_t *allocation = (uint8_t *)se_malloc(SE_ALLOC_BATCH_INPUT, malloc_bytes);
     if (!allocation)
         return 0;
 
@@ -783,7 +641,7 @@ static int build_input_indexed(const text_source_t *src, const size_t *indices,
 }
 
 static void free_input(batch_input_t *input) {
-    free(input->allocation);
+    se_free(input->allocation);
     memset(input, 0, sizeof(*input));
 }
 
@@ -798,8 +656,8 @@ static VALUE binary_string_create(VALUE arg) {
 }
 
 static VALUE binary_string_from_malloc(void *ptr, size_t bytes) {
-    if (!size_fits_long(bytes)) {
-        free(ptr);
+    if (!se_size_fits_long(bytes)) {
+        se_free(ptr);
         rb_raise(rb_eArgError, "embedding output is too large");
     }
 
@@ -809,7 +667,7 @@ static VALUE binary_string_from_malloc(void *ptr, size_t bytes) {
 
     int state = 0;
     VALUE result = rb_protect(binary_string_create, (VALUE)(uintptr_t)&job, &state);
-    free(ptr);
+    se_free(ptr);
     if (state)
         rb_jump_tag(state);
     return result;
@@ -817,23 +675,17 @@ static VALUE binary_string_from_malloc(void *ptr, size_t bytes) {
 
 static VALUE binary_string_from_floats(float *ptr, size_t count, se_vector_format_t format) {
     size_t bytes;
-    if (!checked_mul_size(count, vector_format_element_bytes(format), &bytes) ||
-        !size_fits_long(bytes)) {
-        free(ptr);
+    if (!se_checked_mul_size(count, se_vector_format_element_bytes(format), &bytes) ||
+        !se_size_fits_long(bytes)) {
+        se_free(ptr);
         rb_raise(rb_eArgError, "embedding output is too large");
     }
 
     if (format == SE_VECTOR_FORMAT_F32)
         return binary_string_from_malloc(ptr, bytes);
 
-    uint8_t *encoded = (uint8_t *)malloc(bytes ? bytes : 1);
-    if (!encoded) {
-        free(ptr);
-        rb_raise(rb_eNoMemError, "out of memory while encoding embedding output");
-    }
-    encode_f16_from_floats(encoded, ptr, count);
-    free(ptr);
-    return binary_string_from_malloc(encoded, bytes);
+    se_encode_f16_from_floats((uint8_t *)ptr, ptr, count);
+    return binary_string_from_malloc(ptr, bytes);
 }
 
 typedef struct {
@@ -844,17 +696,47 @@ typedef struct {
     size_t *copy_lens;
 } embed_run_t;
 
+typedef enum {
+    EMBED_RUN_ALLOC_OK = 0,
+    EMBED_RUN_ALLOC_OVERFLOW,
+    EMBED_RUN_ALLOC_OOM
+} embed_run_alloc_status_t;
+
 static void embed_run_free(embed_run_t *run) {
-    free(run->out);
-    free(run->stats);
-    free(run->targets);
-    free(run->pending);
-    free(run->copy_lens);
+    se_free(run->out);
+    se_free(run->stats);
+    se_free(run->targets);
+    se_free(run->pending);
+    se_free(run->copy_lens);
     memset(run, 0, sizeof(*run));
+}
+
+static embed_run_alloc_status_t embed_run_alloc(embed_run_t *run, size_t count, size_t floats) {
+    size_t out_bytes = 0;
+    size_t stats_bytes = 0;
+    size_t targets_bytes = 0;
+
+    memset(run, 0, sizeof(*run));
+    if (!se_alloc_bytes(floats, sizeof(float), &out_bytes) ||
+        !se_alloc_bytes(count, sizeof(se_token_stats_t), &stats_bytes) ||
+        !se_alloc_bytes(count, sizeof(size_t), &targets_bytes))
+        return EMBED_RUN_ALLOC_OVERFLOW;
+
+    run->out = (float *)se_calloc(SE_ALLOC_BATCH_OUTPUT, 1, out_bytes);
+    run->stats = (se_token_stats_t *)se_calloc(SE_ALLOC_BATCH_STATS, 1, stats_bytes);
+    run->targets = (size_t *)se_calloc(SE_ALLOC_BATCH_INDEX, 1, targets_bytes);
+    run->pending = (size_t *)se_calloc(SE_ALLOC_BATCH_INDEX, 1, targets_bytes);
+    run->copy_lens = (size_t *)se_calloc(SE_ALLOC_BATCH_INDEX, 1, targets_bytes);
+    if (run->out && run->stats && run->targets && run->pending && run->copy_lens)
+        return EMBED_RUN_ALLOC_OK;
+
+    embed_run_free(run);
+    return EMBED_RUN_ALLOC_OOM;
 }
 
 static VALUE embed_texts_internal(VALUE self, VALUE texts, int is_array, size_t count,
                                   VALUE max_tokens_opt, se_vector_format_t format,
+                                  se_encoding_validation_t validation,
                                   se_token_stats_t *stats_out) {
     model_wrapper_t *w = get_model(self);
     const se_model_t *model = &w->model;
@@ -862,29 +744,23 @@ static VALUE embed_texts_internal(VALUE self, VALUE texts, int is_array, size_t 
     const uint32_t max_tokens = resolve_max_tokens(model, max_tokens_opt);
 
     text_source_t source;
-    source.snapshot = snapshot_texts(texts, is_array, count);
+    source.snapshot = snapshot_texts(texts, is_array, count, validation);
     source.is_array = is_array;
     const text_source_t *src = &source;
 
     size_t floats;
     size_t out_bytes;
-    if (!checked_mul_size(count, dim, &floats) ||
-        !checked_mul_size(floats, vector_format_element_bytes(format), &out_bytes) ||
-        !size_fits_long(out_bytes))
+    if (!se_checked_mul_size(count, dim, &floats) ||
+        !se_checked_mul_size(floats, se_vector_format_element_bytes(format), &out_bytes) ||
+        !se_size_fits_long(out_bytes))
         rb_raise(rb_eArgError, "embedding output is too large");
 
     embed_run_t run;
-    memset(&run, 0, sizeof(run));
-    size_t slots = count ? count : 1;
-    run.out = (float *)calloc(floats ? floats : 1, sizeof(float));
-    run.stats = (se_token_stats_t *)calloc(slots, sizeof(se_token_stats_t));
-    run.targets = (size_t *)calloc(slots, sizeof(size_t));
-    run.pending = (size_t *)calloc(slots, sizeof(size_t));
-    run.copy_lens = (size_t *)calloc(slots, sizeof(size_t));
-    if (!run.out || !run.stats || !run.targets || !run.pending || !run.copy_lens) {
-        embed_run_free(&run);
+    embed_run_alloc_status_t alloc_status = embed_run_alloc(&run, count, floats);
+    if (alloc_status == EMBED_RUN_ALLOC_OVERFLOW)
+        rb_raise(rb_eArgError, "embedding output is too large");
+    if (alloc_status == EMBED_RUN_ALLOC_OOM)
         rb_raise(rb_eNoMemError, "out of memory");
-    }
 
     size_t initial = prefix_initial_target(max_tokens);
     size_t npending = count;
@@ -964,13 +840,13 @@ static VALUE embed_texts_internal(VALUE self, VALUE texts, int is_array, size_t 
     if (stats_out && count)
         *stats_out = run.stats[0];
 
-    free(run.stats);
+    se_free(run.stats);
     run.stats = NULL;
-    free(run.targets);
+    se_free(run.targets);
     run.targets = NULL;
-    free(run.pending);
+    se_free(run.pending);
     run.pending = NULL;
-    free(run.copy_lens);
+    se_free(run.copy_lens);
     run.copy_lens = NULL;
 
     float *out = run.out;
@@ -982,10 +858,10 @@ static VALUE embed_texts_internal(VALUE self, VALUE texts, int is_array, size_t 
 }
 
 static VALUE embed_batch_internal(VALUE self, VALUE texts, VALUE max_tokens_opt,
-                                  se_vector_format_t format) {
+                                  se_vector_format_t format, se_encoding_validation_t validation) {
     Check_Type(texts, T_ARRAY);
     return embed_texts_internal(self, texts, 1, (size_t)RARRAY_LEN(texts), max_tokens_opt, format,
-                                NULL);
+                                validation, NULL);
 }
 
 static VALUE model_embed_batch(int argc, VALUE *argv, VALUE self) {
@@ -995,26 +871,30 @@ static VALUE model_embed_batch(int argc, VALUE *argv, VALUE self) {
 
     VALUE max_tokens = lookup_option(opts, id_max_tokens);
     se_vector_format_t format = resolve_vector_format(lookup_option(opts, id_format));
-    return embed_batch_internal(self, texts, max_tokens, format);
+    se_encoding_validation_t validation =
+        resolve_encoding_validation(lookup_option(opts, id_validate_encoding));
+    return embed_batch_internal(self, texts, max_tokens, format, validation);
 }
 
 static VALUE embed_one_via_batch(VALUE self, VALUE text, VALUE max_tokens_opt,
-                                 se_vector_format_t format, se_token_stats_t *stats) {
-    return embed_texts_internal(self, text, 0, 1, max_tokens_opt, format, stats);
+                                 se_vector_format_t format, se_encoding_validation_t validation,
+                                 se_token_stats_t *stats) {
+    return embed_texts_internal(self, text, 0, 1, max_tokens_opt, format, validation, stats);
 }
 
 static VALUE embed_one_value(VALUE self, VALUE text, VALUE max_tokens_opt,
-                             se_vector_format_t format, se_token_stats_t *stats) {
+                             se_vector_format_t format, se_encoding_validation_t validation,
+                             se_token_stats_t *stats) {
     model_wrapper_t *w = get_model(self);
     Check_Type(text, T_STRING);
-    check_text_encoding(text);
+    check_text_encoding_mode(text, -1, validation);
 
     if (format != SE_VECTOR_FORMAT_F32 || (size_t)RSTRING_LEN(text) >= SE_GVL_UNLOCK_THRESHOLD)
-        return embed_one_via_batch(self, text, max_tokens_opt, format, stats);
+        return embed_one_via_batch(self, text, max_tokens_opt, format, validation, stats);
 
     const uint32_t dim = w->model.meta.dim;
     size_t out_bytes;
-    if (!checked_mul_size(dim, sizeof(float), &out_bytes) || !size_fits_long(out_bytes))
+    if (!se_checked_mul_size(dim, sizeof(float), &out_bytes) || !se_size_fits_long(out_bytes))
         rb_raise(rb_eArgError, "embedding output is too large");
 
     VALUE result = rb_str_new(NULL, (long)out_bytes);
@@ -1049,7 +929,9 @@ static VALUE model_embed(int argc, VALUE *argv, VALUE self) {
     rb_scan_args(argc, argv, "1:", &text, &opts);
     reject_parallel_threads(opts);
     return embed_one_value(self, text, lookup_option(opts, id_max_tokens),
-                           resolve_vector_format(lookup_option(opts, id_format)), NULL);
+                           resolve_vector_format(lookup_option(opts, id_format)),
+                           resolve_encoding_validation(lookup_option(opts, id_validate_encoding)),
+                           NULL);
 }
 
 static VALUE model_embed_with_stats(int argc, VALUE *argv, VALUE self) {
@@ -1058,8 +940,10 @@ static VALUE model_embed_with_stats(int argc, VALUE *argv, VALUE self) {
     reject_parallel_threads(opts);
 
     se_token_stats_t stats;
-    VALUE vector = embed_one_value(self, text, lookup_option(opts, id_max_tokens),
-                                   resolve_vector_format(lookup_option(opts, id_format)), &stats);
+    VALUE vector = embed_one_value(
+        self, text, lookup_option(opts, id_max_tokens),
+        resolve_vector_format(lookup_option(opts, id_format)),
+        resolve_encoding_validation(lookup_option(opts, id_validate_encoding)), &stats);
 
     VALUE hash = rb_hash_new();
     rb_hash_aset(hash, ID2SYM(id_vector), vector);
@@ -1075,7 +959,8 @@ static VALUE model_tokenize(int argc, VALUE *argv, VALUE self) {
 
     model_wrapper_t *w = get_model(self);
     Check_Type(text, T_STRING);
-    check_text_encoding(text);
+    check_text_encoding_mode(
+        text, -1, resolve_encoding_validation(lookup_option(opts, id_validate_encoding)));
 
     uint32_t max_tokens = resolve_max_tokens(&w->model, lookup_option(opts, id_max_tokens));
 
@@ -1183,7 +1068,11 @@ static VALUE embed_token_ids_body(VALUE arg) {
         run->ids[i] = (uint32_t)conv.value;
     }
 
-    run->out = (float *)calloc(run->model->meta.dim ? run->model->meta.dim : 1, sizeof(float));
+    size_t out_bytes;
+    if (!se_alloc_bytes(run->model->meta.dim, sizeof(float), &out_bytes))
+        rb_raise(rb_eArgError, "embedding output is too large");
+
+    run->out = (float *)se_calloc(SE_ALLOC_BATCH_OUTPUT, 1, out_bytes);
     if (!run->out)
         rb_raise(rb_eNoMemError, "out of memory");
 
@@ -1214,7 +1103,7 @@ static VALUE embed_token_ids_body(VALUE arg) {
     if (run->stats_out)
         *run->stats_out = run->stats;
 
-    free(run->ids);
+    se_free(run->ids);
     run->ids = NULL;
 
     float *out = run->out;
@@ -1224,8 +1113,8 @@ static VALUE embed_token_ids_body(VALUE arg) {
 
 static VALUE embed_token_ids_ensure(VALUE arg) {
     ids_run_t *run = (ids_run_t *)(uintptr_t)arg;
-    free(run->ids);
-    free(run->out);
+    se_free(run->ids);
+    se_free(run->out);
     run->ids = NULL;
     run->out = NULL;
     return Qnil;
@@ -1247,12 +1136,13 @@ static VALUE embed_token_ids_value(VALUE self, VALUE ids_value, VALUE max_tokens
     }
 
     size_t ids_bytes;
-    if (!checked_mul_size(n ? n : 1, sizeof(uint32_t), &ids_bytes))
+    if (!se_alloc_bytes(n, sizeof(uint32_t), &ids_bytes))
         rb_raise(rb_eArgError, "token id array is too large");
 
     size_t out_bytes;
-    if (!checked_mul_size(w->model.meta.dim, vector_format_element_bytes(format), &out_bytes) ||
-        !size_fits_long(out_bytes))
+    if (!se_checked_mul_size(w->model.meta.dim, se_vector_format_element_bytes(format),
+                             &out_bytes) ||
+        !se_size_fits_long(out_bytes))
         rb_raise(rb_eArgError, "embedding output is too large");
 
     ids_run_t run;
@@ -1265,7 +1155,7 @@ static VALUE embed_token_ids_value(VALUE self, VALUE ids_value, VALUE max_tokens
     run.format = format;
     run.stats_out = stats_out;
     run.truncated = truncated;
-    run.ids = (uint32_t *)malloc(ids_bytes);
+    run.ids = (uint32_t *)se_malloc(SE_ALLOC_TOKEN_IDS, ids_bytes);
     if (!run.ids)
         rb_raise(rb_eNoMemError, "out of memory");
 
@@ -1303,22 +1193,8 @@ static VALUE model_embed_token_ids_with_stats(int argc, VALUE *argv, VALUE self)
 }
 
 typedef struct {
-    const float *q;
-    const void *m;
-    se_vector_format_t format;
-    size_t dim;
-    size_t rows;
-    long k;
-    size_t *best_idx;
-    float *best_score;
-    int cosine;
-    float inv_query_norm;
-    volatile sig_atomic_t cancelled;
-} topk_job_t;
-
-typedef struct {
     VALUE matrix;
-    topk_job_t job;
+    se_topk_job_t job;
     float *q_copy;
     float *matrix_copy;
     size_t matrix_bytes;
@@ -1330,458 +1206,9 @@ static int ptr_is_float_aligned(const void *ptr) {
 }
 
 static void topk_unblock_cancel(void *arg) {
-    topk_job_t *job = (topk_job_t *)arg;
+    se_topk_job_t *job = (se_topk_job_t *)arg;
     if (job)
         job->cancelled = 1;
-}
-
-static float dot_product_unrolled(const float *q, const float *row, size_t dim) {
-    size_t j = 0;
-#if defined(SE_HAVE_NEON)
-    float32x4_t a0 = vdupq_n_f32(0.0f);
-    float32x4_t a1 = vdupq_n_f32(0.0f);
-    float32x4_t a2 = vdupq_n_f32(0.0f);
-    float32x4_t a3 = vdupq_n_f32(0.0f);
-    for (; j + 15 < dim; j += 16) {
-        a0 = vmlaq_f32(a0, vld1q_f32(q + j), vld1q_f32(row + j));
-        a1 = vmlaq_f32(a1, vld1q_f32(q + j + 4), vld1q_f32(row + j + 4));
-        a2 = vmlaq_f32(a2, vld1q_f32(q + j + 8), vld1q_f32(row + j + 8));
-        a3 = vmlaq_f32(a3, vld1q_f32(q + j + 12), vld1q_f32(row + j + 12));
-    }
-    float32x4_t sumv = vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3));
-#if defined(__aarch64__)
-    float dot = vaddvq_f32(sumv);
-#else
-    float32x2_t pair = vadd_f32(vget_low_f32(sumv), vget_high_f32(sumv));
-    pair = vpadd_f32(pair, pair);
-    float dot = vget_lane_f32(pair, 0);
-#endif
-#elif defined(SE_HAVE_SSE)
-    __m128 a0 = _mm_setzero_ps();
-    __m128 a1 = _mm_setzero_ps();
-    __m128 a2 = _mm_setzero_ps();
-    __m128 a3 = _mm_setzero_ps();
-    for (; j + 15 < dim; j += 16) {
-        a0 = _mm_add_ps(a0, _mm_mul_ps(_mm_loadu_ps(q + j), _mm_loadu_ps(row + j)));
-        a1 = _mm_add_ps(a1, _mm_mul_ps(_mm_loadu_ps(q + j + 4), _mm_loadu_ps(row + j + 4)));
-        a2 = _mm_add_ps(a2, _mm_mul_ps(_mm_loadu_ps(q + j + 8), _mm_loadu_ps(row + j + 8)));
-        a3 = _mm_add_ps(a3, _mm_mul_ps(_mm_loadu_ps(q + j + 12), _mm_loadu_ps(row + j + 12)));
-    }
-    __m128 sumv = _mm_add_ps(_mm_add_ps(a0, a1), _mm_add_ps(a2, a3));
-    float tmp[4];
-    _mm_storeu_ps(tmp, sumv);
-    float dot = (tmp[0] + tmp[1]) + (tmp[2] + tmp[3]);
-#else
-    float s0 = 0.0f;
-    float s1 = 0.0f;
-    float s2 = 0.0f;
-    float s3 = 0.0f;
-    float s4 = 0.0f;
-    float s5 = 0.0f;
-    float s6 = 0.0f;
-    float s7 = 0.0f;
-    for (; j + 7 < dim; j += 8) {
-        s0 += q[j] * row[j];
-        s1 += q[j + 1] * row[j + 1];
-        s2 += q[j + 2] * row[j + 2];
-        s3 += q[j + 3] * row[j + 3];
-        s4 += q[j + 4] * row[j + 4];
-        s5 += q[j + 5] * row[j + 5];
-        s6 += q[j + 6] * row[j + 6];
-        s7 += q[j + 7] * row[j + 7];
-    }
-    float dot = (s0 + s1) + (s2 + s3) + (s4 + s5) + (s6 + s7);
-#endif
-    for (; j < dim; j++)
-        dot += q[j] * row[j];
-    return dot;
-}
-
-static float dot_and_row_sq_unrolled(const float *q, const float *row, size_t dim,
-                                     float *row_sq_out) {
-    size_t j = 0;
-#if defined(SE_HAVE_NEON)
-    float32x4_t d0 = vdupq_n_f32(0.0f);
-    float32x4_t d1 = vdupq_n_f32(0.0f);
-    float32x4_t d2 = vdupq_n_f32(0.0f);
-    float32x4_t d3 = vdupq_n_f32(0.0f);
-    float32x4_t s0 = vdupq_n_f32(0.0f);
-    float32x4_t s1 = vdupq_n_f32(0.0f);
-    float32x4_t s2 = vdupq_n_f32(0.0f);
-    float32x4_t s3 = vdupq_n_f32(0.0f);
-    for (; j + 15 < dim; j += 16) {
-        float32x4_t q0 = vld1q_f32(q + j);
-        float32x4_t r0 = vld1q_f32(row + j);
-        float32x4_t q1 = vld1q_f32(q + j + 4);
-        float32x4_t r1 = vld1q_f32(row + j + 4);
-        float32x4_t q2 = vld1q_f32(q + j + 8);
-        float32x4_t r2 = vld1q_f32(row + j + 8);
-        float32x4_t q3 = vld1q_f32(q + j + 12);
-        float32x4_t r3 = vld1q_f32(row + j + 12);
-        d0 = vmlaq_f32(d0, q0, r0);
-        d1 = vmlaq_f32(d1, q1, r1);
-        d2 = vmlaq_f32(d2, q2, r2);
-        d3 = vmlaq_f32(d3, q3, r3);
-        s0 = vmlaq_f32(s0, r0, r0);
-        s1 = vmlaq_f32(s1, r1, r1);
-        s2 = vmlaq_f32(s2, r2, r2);
-        s3 = vmlaq_f32(s3, r3, r3);
-    }
-    float32x4_t dotv = vaddq_f32(vaddq_f32(d0, d1), vaddq_f32(d2, d3));
-    float32x4_t sqv = vaddq_f32(vaddq_f32(s0, s1), vaddq_f32(s2, s3));
-#if defined(__aarch64__)
-    float dot = vaddvq_f32(dotv);
-    float row_sq = vaddvq_f32(sqv);
-#else
-    float32x2_t pair = vadd_f32(vget_low_f32(dotv), vget_high_f32(dotv));
-    pair = vpadd_f32(pair, pair);
-    float dot = vget_lane_f32(pair, 0);
-    pair = vadd_f32(vget_low_f32(sqv), vget_high_f32(sqv));
-    pair = vpadd_f32(pair, pair);
-    float row_sq = vget_lane_f32(pair, 0);
-#endif
-#elif defined(SE_HAVE_SSE)
-    __m128 d0 = _mm_setzero_ps();
-    __m128 d1 = _mm_setzero_ps();
-    __m128 d2 = _mm_setzero_ps();
-    __m128 d3 = _mm_setzero_ps();
-    __m128 s0 = _mm_setzero_ps();
-    __m128 s1 = _mm_setzero_ps();
-    __m128 s2 = _mm_setzero_ps();
-    __m128 s3 = _mm_setzero_ps();
-    for (; j + 15 < dim; j += 16) {
-        __m128 q0 = _mm_loadu_ps(q + j);
-        __m128 r0 = _mm_loadu_ps(row + j);
-        __m128 q1 = _mm_loadu_ps(q + j + 4);
-        __m128 r1 = _mm_loadu_ps(row + j + 4);
-        __m128 q2 = _mm_loadu_ps(q + j + 8);
-        __m128 r2 = _mm_loadu_ps(row + j + 8);
-        __m128 q3 = _mm_loadu_ps(q + j + 12);
-        __m128 r3 = _mm_loadu_ps(row + j + 12);
-        d0 = _mm_add_ps(d0, _mm_mul_ps(q0, r0));
-        d1 = _mm_add_ps(d1, _mm_mul_ps(q1, r1));
-        d2 = _mm_add_ps(d2, _mm_mul_ps(q2, r2));
-        d3 = _mm_add_ps(d3, _mm_mul_ps(q3, r3));
-        s0 = _mm_add_ps(s0, _mm_mul_ps(r0, r0));
-        s1 = _mm_add_ps(s1, _mm_mul_ps(r1, r1));
-        s2 = _mm_add_ps(s2, _mm_mul_ps(r2, r2));
-        s3 = _mm_add_ps(s3, _mm_mul_ps(r3, r3));
-    }
-    __m128 dotv = _mm_add_ps(_mm_add_ps(d0, d1), _mm_add_ps(d2, d3));
-    __m128 sqv = _mm_add_ps(_mm_add_ps(s0, s1), _mm_add_ps(s2, s3));
-    float tmp[4];
-    _mm_storeu_ps(tmp, dotv);
-    float dot = (tmp[0] + tmp[1]) + (tmp[2] + tmp[3]);
-    _mm_storeu_ps(tmp, sqv);
-    float row_sq = (tmp[0] + tmp[1]) + (tmp[2] + tmp[3]);
-#else
-    float d0 = 0.0f;
-    float d1 = 0.0f;
-    float d2 = 0.0f;
-    float d3 = 0.0f;
-    float s0 = 0.0f;
-    float s1 = 0.0f;
-    float s2 = 0.0f;
-    float s3 = 0.0f;
-    for (; j + 3 < dim; j += 4) {
-        float r0 = row[j];
-        float r1 = row[j + 1];
-        float r2 = row[j + 2];
-        float r3 = row[j + 3];
-        d0 += q[j] * r0;
-        d1 += q[j + 1] * r1;
-        d2 += q[j + 2] * r2;
-        d3 += q[j + 3] * r3;
-        s0 += r0 * r0;
-        s1 += r1 * r1;
-        s2 += r2 * r2;
-        s3 += r3 * r3;
-    }
-    float dot = (d0 + d1) + (d2 + d3);
-    float row_sq = (s0 + s1) + (s2 + s3);
-#endif
-    for (; j < dim; j++) {
-        float r = row[j];
-        dot += q[j] * r;
-        row_sq += r * r;
-    }
-    *row_sq_out = row_sq;
-    return dot;
-}
-
-#if defined(SE_NEED_F16_LUT)
-static float dot_product_f16_lut(const float *q, const uint8_t *row, size_t dim) {
-    size_t j = 0;
-    float s0 = 0.0f;
-    float s1 = 0.0f;
-    float s2 = 0.0f;
-    float s3 = 0.0f;
-    for (; j + 3 < dim; j += 4) {
-        s0 += q[j] * se_f16_lut[read_u16le(row + j * 2)];
-        s1 += q[j + 1] * se_f16_lut[read_u16le(row + (j + 1) * 2)];
-        s2 += q[j + 2] * se_f16_lut[read_u16le(row + (j + 2) * 2)];
-        s3 += q[j + 3] * se_f16_lut[read_u16le(row + (j + 3) * 2)];
-    }
-    float dot = (s0 + s1) + (s2 + s3);
-    for (; j < dim; j++)
-        dot += q[j] * se_f16_lut[read_u16le(row + j * 2)];
-    return dot;
-}
-
-static float dot_and_row_sq_f16_lut(const float *q, const uint8_t *row, size_t dim,
-                                    float *row_sq_out) {
-    size_t j = 0;
-    float d0 = 0.0f;
-    float d1 = 0.0f;
-    float d2 = 0.0f;
-    float d3 = 0.0f;
-    float s0 = 0.0f;
-    float s1 = 0.0f;
-    float s2 = 0.0f;
-    float s3 = 0.0f;
-    for (; j + 3 < dim; j += 4) {
-        float r0 = se_f16_lut[read_u16le(row + j * 2)];
-        float r1 = se_f16_lut[read_u16le(row + (j + 1) * 2)];
-        float r2 = se_f16_lut[read_u16le(row + (j + 2) * 2)];
-        float r3 = se_f16_lut[read_u16le(row + (j + 3) * 2)];
-        d0 += q[j] * r0;
-        d1 += q[j + 1] * r1;
-        d2 += q[j + 2] * r2;
-        d3 += q[j + 3] * r3;
-        s0 += r0 * r0;
-        s1 += r1 * r1;
-        s2 += r2 * r2;
-        s3 += r3 * r3;
-    }
-    float dot = (d0 + d1) + (d2 + d3);
-    float row_sq = (s0 + s1) + (s2 + s3);
-    for (; j < dim; j++) {
-        float r = se_f16_lut[read_u16le(row + j * 2)];
-        dot += q[j] * r;
-        row_sq += r * r;
-    }
-    *row_sq_out = row_sq;
-    return dot;
-}
-#endif /* SE_NEED_F16_LUT */
-
-#if defined(SE_HAVE_NEON_FP16)
-static float dot_product_f16_neon(const float *q, const uint8_t *row, size_t dim) {
-    size_t j = 0;
-    float32x4_t a0 = vdupq_n_f32(0.0f);
-    float32x4_t a1 = vdupq_n_f32(0.0f);
-    for (; j + 7 < dim; j += 8) {
-        float16x4_t h0 =
-            vreinterpret_f16_u16(vld1_u16((const uint16_t *)(const void *)(row + j * 2)));
-        float16x4_t h1 =
-            vreinterpret_f16_u16(vld1_u16((const uint16_t *)(const void *)(row + (j + 4) * 2)));
-        float32x4_t r0 = vcvt_f32_f16(h0);
-        float32x4_t r1 = vcvt_f32_f16(h1);
-        a0 = vmlaq_f32(a0, vld1q_f32(q + j), r0);
-        a1 = vmlaq_f32(a1, vld1q_f32(q + j + 4), r1);
-    }
-    float32x4_t sumv = vaddq_f32(a0, a1);
-    float dot = vaddvq_f32(sumv);
-    for (; j < dim; j++)
-        dot += q[j] * f16_bits_to_float(read_u16le(row + j * 2));
-    return dot;
-}
-
-static float dot_and_row_sq_f16_neon(const float *q, const uint8_t *row, size_t dim,
-                                     float *row_sq_out) {
-    size_t j = 0;
-    float32x4_t d0 = vdupq_n_f32(0.0f);
-    float32x4_t d1 = vdupq_n_f32(0.0f);
-    float32x4_t s0 = vdupq_n_f32(0.0f);
-    float32x4_t s1 = vdupq_n_f32(0.0f);
-    for (; j + 7 < dim; j += 8) {
-        float16x4_t h0 =
-            vreinterpret_f16_u16(vld1_u16((const uint16_t *)(const void *)(row + j * 2)));
-        float16x4_t h1 =
-            vreinterpret_f16_u16(vld1_u16((const uint16_t *)(const void *)(row + (j + 4) * 2)));
-        float32x4_t r0 = vcvt_f32_f16(h0);
-        float32x4_t r1 = vcvt_f32_f16(h1);
-        d0 = vmlaq_f32(d0, vld1q_f32(q + j), r0);
-        d1 = vmlaq_f32(d1, vld1q_f32(q + j + 4), r1);
-        s0 = vmlaq_f32(s0, r0, r0);
-        s1 = vmlaq_f32(s1, r1, r1);
-    }
-    float dot = vaddvq_f32(vaddq_f32(d0, d1));
-    float row_sq = vaddvq_f32(vaddq_f32(s0, s1));
-    for (; j < dim; j++) {
-        float r = f16_bits_to_float(read_u16le(row + j * 2));
-        dot += q[j] * r;
-        row_sq += r * r;
-    }
-    *row_sq_out = row_sq;
-    return dot;
-}
-#endif
-
-#if defined(SE_HAVE_X86_F16C_TARGET)
-__attribute__((target("f16c,avx"))) static float hsum256_f16c(__m256 v) {
-    __m128 low = _mm256_castps256_ps128(v);
-    __m128 high = _mm256_extractf128_ps(v, 1);
-    __m128 sum = _mm_add_ps(low, high);
-    float tmp[4];
-    _mm_storeu_ps(tmp, sum);
-    return (tmp[0] + tmp[1]) + (tmp[2] + tmp[3]);
-}
-
-__attribute__((target("f16c,avx"))) static float
-dot_product_f16_f16c(const float *q, const uint8_t *row, size_t dim) {
-    size_t j = 0;
-    __m256 a0 = _mm256_setzero_ps();
-    __m256 a1 = _mm256_setzero_ps();
-    for (; j + 15 < dim; j += 16) {
-        __m256 r0 = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(const void *)(row + j * 2)));
-        __m256 r1 =
-            _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(const void *)(row + (j + 8) * 2)));
-        a0 = _mm256_add_ps(a0, _mm256_mul_ps(_mm256_loadu_ps(q + j), r0));
-        a1 = _mm256_add_ps(a1, _mm256_mul_ps(_mm256_loadu_ps(q + j + 8), r1));
-    }
-    float dot = hsum256_f16c(_mm256_add_ps(a0, a1));
-    for (; j + 7 < dim; j += 8) {
-        __m256 r = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(const void *)(row + j * 2)));
-        dot += hsum256_f16c(_mm256_mul_ps(_mm256_loadu_ps(q + j), r));
-    }
-    for (; j < dim; j++)
-        dot += q[j] * f16_bits_to_float(read_u16le(row + j * 2));
-    return dot;
-}
-
-__attribute__((target("f16c,avx"))) static float
-dot_and_row_sq_f16_f16c(const float *q, const uint8_t *row, size_t dim, float *row_sq_out) {
-    size_t j = 0;
-    __m256 d0 = _mm256_setzero_ps();
-    __m256 d1 = _mm256_setzero_ps();
-    __m256 s0 = _mm256_setzero_ps();
-    __m256 s1 = _mm256_setzero_ps();
-    for (; j + 15 < dim; j += 16) {
-        __m256 r0 = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(const void *)(row + j * 2)));
-        __m256 r1 =
-            _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(const void *)(row + (j + 8) * 2)));
-        d0 = _mm256_add_ps(d0, _mm256_mul_ps(_mm256_loadu_ps(q + j), r0));
-        d1 = _mm256_add_ps(d1, _mm256_mul_ps(_mm256_loadu_ps(q + j + 8), r1));
-        s0 = _mm256_add_ps(s0, _mm256_mul_ps(r0, r0));
-        s1 = _mm256_add_ps(s1, _mm256_mul_ps(r1, r1));
-    }
-    float dot = hsum256_f16c(_mm256_add_ps(d0, d1));
-    float row_sq = hsum256_f16c(_mm256_add_ps(s0, s1));
-    for (; j + 7 < dim; j += 8) {
-        __m256 r = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(const void *)(row + j * 2)));
-        dot += hsum256_f16c(_mm256_mul_ps(_mm256_loadu_ps(q + j), r));
-        row_sq += hsum256_f16c(_mm256_mul_ps(r, r));
-    }
-    for (; j < dim; j++) {
-        float r = f16_bits_to_float(read_u16le(row + j * 2));
-        dot += q[j] * r;
-        row_sq += r * r;
-    }
-    *row_sq_out = row_sq;
-    return dot;
-}
-#endif
-
-static float dot_product_f16(const float *q, const uint8_t *row, size_t dim) {
-#if defined(SE_HAVE_NEON_FP16)
-    return dot_product_f16_neon(q, row, dim);
-#else
-#if defined(SE_HAVE_X86_F16C_TARGET)
-    if (se_f16_backend == SE_F16_BACKEND_F16C)
-        return dot_product_f16_f16c(q, row, dim);
-#endif
-    return dot_product_f16_lut(q, row, dim);
-#endif
-}
-
-static float dot_and_row_sq_f16(const float *q, const uint8_t *row, size_t dim, float *row_sq_out) {
-#if defined(SE_HAVE_NEON_FP16)
-    return dot_and_row_sq_f16_neon(q, row, dim, row_sq_out);
-#else
-#if defined(SE_HAVE_X86_F16C_TARGET)
-    if (se_f16_backend == SE_F16_BACKEND_F16C)
-        return dot_and_row_sq_f16_f16c(q, row, dim, row_sq_out);
-#endif
-    return dot_and_row_sq_f16_lut(q, row, dim, row_sq_out);
-#endif
-}
-
-static void select_f16_backend(void) {
-#if defined(SE_HAVE_NEON_FP16)
-    se_f16_backend = SE_F16_BACKEND_NEON_FP16;
-#else
-#if defined(SE_HAVE_X86_F16C_TARGET)
-    if (detect_x86_f16c()) {
-        se_f16_backend = SE_F16_BACKEND_F16C;
-        return;
-    }
-#endif
-    se_f16_backend = SE_F16_BACKEND_LUT;
-    init_f16_lut();
-#endif
-}
-
-static VALUE se_simd_backend(VALUE self) {
-    (void)self;
-    switch (se_f16_backend) {
-    case SE_F16_BACKEND_NEON_FP16:
-        return rb_str_new_cstr("neon-fp16");
-    case SE_F16_BACKEND_F16C:
-        return rb_str_new_cstr("f16c");
-    default:
-        return rb_str_new_cstr("lut");
-    }
-}
-
-static float cosine_score(float dot, float row_sq, float inv_query_norm) {
-    if (row_sq > 0.0f)
-        return dot * inv_query_norm / sqrtf(row_sq);
-    if (row_sq == 0.0f)
-        return 0.0f;
-    return NAN;
-}
-
-static void *topk_execute(void *arg) {
-    topk_job_t *job = (topk_job_t *)arg;
-    for (size_t r = 0; r < job->rows; r++) {
-        if ((r & 1023u) == 0 && job->cancelled)
-            return NULL;
-        float score;
-
-        if (job->format == SE_VECTOR_FORMAT_F16) {
-            const uint8_t *row = (const uint8_t *)job->m + r * job->dim * 2u;
-            if (job->cosine) {
-                float row_sq = 0.0f;
-                score = dot_and_row_sq_f16(job->q, row, job->dim, &row_sq);
-                score = cosine_score(score, row_sq, job->inv_query_norm);
-            } else {
-                score = dot_product_f16(job->q, row, job->dim);
-            }
-        } else {
-            const float *row = (const float *)job->m + r * job->dim;
-            if (job->cosine) {
-                float row_sq = 0.0f;
-                score = dot_and_row_sq_unrolled(job->q, row, job->dim, &row_sq);
-                score = cosine_score(score, row_sq, job->inv_query_norm);
-            } else {
-                score = dot_product_unrolled(job->q, row, job->dim);
-            }
-        }
-
-        if (!(score > job->best_score[job->k - 1]))
-            continue;
-
-        long pos = job->k - 1;
-        while (pos > 0 && job->best_score[pos - 1] < score) {
-            job->best_score[pos] = job->best_score[pos - 1];
-            job->best_idx[pos] = job->best_idx[pos - 1];
-            pos--;
-        }
-        job->best_score[pos] = score;
-        job->best_idx[pos] = r;
-    }
-    return NULL;
 }
 
 static VALUE topk_body(VALUE arg) {
@@ -1796,17 +1223,17 @@ static VALUE topk_body(VALUE arg) {
     }
 
     if (run->job.cosine) {
-        float query_sq = dot_product_unrolled(run->job.q, run->job.q, run->job.dim);
+        float query_sq = se_dot_product_f32(run->job.q, run->job.q, run->job.dim);
         if (!(query_sq > 0.0f))
             rb_raise(rb_eArgError, "cosine_top_k needs a query with a non-zero norm");
         run->job.inv_query_norm = 1.0f / sqrtf(query_sq);
     }
 
     if (run->release_gvl) {
-        rb_thread_call_without_gvl(topk_execute, &run->job, topk_unblock_cancel, &run->job);
+        rb_thread_call_without_gvl(se_topk_execute, &run->job, topk_unblock_cancel, &run->job);
         rb_thread_check_ints();
     } else {
-        topk_execute(&run->job);
+        se_topk_execute(&run->job);
         rb_thread_check_ints();
     }
 
@@ -1827,10 +1254,10 @@ static VALUE topk_body(VALUE arg) {
 
 static VALUE topk_ensure(VALUE arg) {
     topk_run_t *run = (topk_run_t *)(uintptr_t)arg;
-    free(run->q_copy);
-    free(run->matrix_copy);
-    free(run->job.best_idx);
-    free(run->job.best_score);
+    se_free(run->q_copy);
+    se_free(run->matrix_copy);
+    se_free(run->job.best_idx);
+    se_free(run->job.best_score);
     run->q_copy = NULL;
     run->matrix_copy = NULL;
     run->job.best_idx = NULL;
@@ -1894,11 +1321,11 @@ static VALUE top_k_impl(int argc, VALUE *argv, VALUE self, int cosine) {
     Check_Type(matrix, T_STRING);
 
     se_vector_format_t format = resolve_vector_format(lookup_option(opts, id_format));
-    size_t element_bytes = vector_format_element_bytes(format);
+    size_t element_bytes = se_vector_format_element_bytes(format);
     size_t dim = topk_required_dim(opts);
 
     size_t row_bytes;
-    if (!checked_mul_size(dim, element_bytes, &row_bytes) || !size_fits_long(row_bytes))
+    if (!se_checked_mul_size(dim, element_bytes, &row_bytes) || !se_size_fits_long(row_bytes))
         rb_raise(rb_eArgError, "dim: is too large");
 
     if ((size_t)RSTRING_LEN(query) != row_bytes)
@@ -1938,14 +1365,22 @@ static VALUE top_k_impl(int argc, VALUE *argv, VALUE self, int cosine) {
     run.job.inv_query_norm = 1.0f;
 
     size_t q_float_bytes;
-    if (!checked_mul_size(dim, sizeof(float), &q_float_bytes))
+    if (!se_checked_mul_size(dim, sizeof(float), &q_float_bytes))
         rb_raise(rb_eArgError, "dim: is too large");
 
-    run.q_copy = (float *)malloc(q_float_bytes);
-    run.job.best_idx = (size_t *)calloc((size_t)k, sizeof(size_t));
-    run.job.best_score = (float *)malloc((size_t)k * sizeof(float));
+    run.q_copy = (float *)se_malloc(SE_ALLOC_TOPK_QUERY, q_float_bytes);
+    size_t best_idx_bytes = 0;
+    size_t best_score_bytes = 0;
+    if (!se_array_bytes((size_t)k, sizeof(size_t), &best_idx_bytes) ||
+        !se_array_bytes((size_t)k, sizeof(float), &best_score_bytes)) {
+        topk_ensure((VALUE)(uintptr_t)&run);
+        rb_raise(rb_eArgError, "k is too large");
+    }
+
+    run.job.best_idx = (size_t *)se_calloc(SE_ALLOC_TOPK_BEST, 1, best_idx_bytes);
+    run.job.best_score = (float *)se_malloc(SE_ALLOC_TOPK_BEST, best_score_bytes);
     if (needs_copy)
-        run.matrix_copy = (float *)malloc(matrix_bytes ? matrix_bytes : 1);
+        run.matrix_copy = (float *)se_malloc(SE_ALLOC_TOPK_MATRIX_COPY, matrix_bytes);
     if (!run.q_copy || !run.job.best_idx || !run.job.best_score ||
         (needs_copy && !run.matrix_copy)) {
         topk_ensure((VALUE)(uintptr_t)&run);
@@ -1953,7 +1388,7 @@ static VALUE top_k_impl(int argc, VALUE *argv, VALUE self, int cosine) {
     }
 
     if (format == SE_VECTOR_FORMAT_F16)
-        decode_f16_to_floats(run.q_copy, (const uint8_t *)RSTRING_PTR(query), dim);
+        se_decode_f16_to_floats(run.q_copy, (const uint8_t *)RSTRING_PTR(query), dim);
     else
         memcpy(run.q_copy, RSTRING_PTR(query), row_bytes);
     run.job.q = run.q_copy;
@@ -1982,14 +1417,14 @@ static VALUE se_encode_f16(VALUE self, VALUE ary) {
 
     long n = RARRAY_LEN(ary);
     size_t bytes;
-    if (!checked_mul_size((size_t)n, 2, &bytes) || !size_fits_long(bytes))
+    if (!se_checked_mul_size((size_t)n, 2, &bytes) || !se_size_fits_long(bytes))
         rb_raise(rb_eArgError, "vector is too large");
 
     VALUE out = rb_str_new(NULL, (long)bytes);
     rb_enc_associate(out, binary_encoding);
     for (long i = 0; i < n; i++) {
         double v = NUM2DBL(rb_ary_entry(ary, i));
-        write_u16le((uint8_t *)RSTRING_PTR(out) + (size_t)i * 2, float_to_f16_bits((float)v));
+        se_write_f16le((uint8_t *)RSTRING_PTR(out) + (size_t)i * 2, (float)v);
     }
     return out;
 }
@@ -2005,14 +1440,52 @@ static VALUE se_decode_f16(VALUE self, VALUE blob) {
     VALUE out = rb_ary_new_capa(n / 2);
     for (long i = 0; i < n / 2; i++) {
         const uint8_t *src = (const uint8_t *)RSTRING_PTR(blob) + (size_t)i * 2;
-        rb_ary_push(out, DBL2NUM((double)f16_bits_to_float(read_u16le(src))));
+        rb_ary_push(out, DBL2NUM((double)se_read_f16le(src)));
     }
     RB_GC_GUARD(blob);
     return out;
 }
 
+#if SE_ENABLE_ALLOC_STATS
+static VALUE se_alloc_stats_hash(VALUE self) {
+    (void)self;
+    se_alloc_stats_t stats[SE_ALLOC_CATEGORY_COUNT];
+    se_alloc_stats_snapshot(stats);
+
+    VALUE out = rb_hash_new();
+    ID id_current_bytes = rb_intern("current_bytes");
+    ID id_peak_bytes = rb_intern("peak_bytes");
+    ID id_total_allocated_bytes = rb_intern("total_allocated_bytes");
+    ID id_total_freed_bytes = rb_intern("total_freed_bytes");
+    ID id_alloc_count = rb_intern("alloc_count");
+    ID id_realloc_count = rb_intern("realloc_count");
+    ID id_free_count = rb_intern("free_count");
+
+    for (int i = 0; i < SE_ALLOC_CATEGORY_COUNT; i++) {
+        VALUE item = rb_hash_new();
+        rb_hash_aset(item, ID2SYM(id_current_bytes), SIZET2NUM(stats[i].current_bytes));
+        rb_hash_aset(item, ID2SYM(id_peak_bytes), SIZET2NUM(stats[i].peak_bytes));
+        rb_hash_aset(item, ID2SYM(id_total_allocated_bytes),
+                     SIZET2NUM(stats[i].total_allocated_bytes));
+        rb_hash_aset(item, ID2SYM(id_total_freed_bytes), SIZET2NUM(stats[i].total_freed_bytes));
+        rb_hash_aset(item, ID2SYM(id_alloc_count), SIZET2NUM(stats[i].alloc_count));
+        rb_hash_aset(item, ID2SYM(id_realloc_count), SIZET2NUM(stats[i].realloc_count));
+        rb_hash_aset(item, ID2SYM(id_free_count), SIZET2NUM(stats[i].free_count));
+        rb_hash_aset(out, ID2SYM(rb_intern(se_alloc_category_name((se_alloc_category_t)i))), item);
+    }
+
+    return out;
+}
+
+static VALUE se_alloc_stats_reset_bang(VALUE self) {
+    (void)self;
+    se_alloc_stats_reset();
+    return Qnil;
+}
+#endif
+
 RUBY_FUNC_EXPORTED void Init_static_embeddings(void) {
-    select_f16_backend();
+    se_select_f16_backend();
     binary_encoding = rb_ascii8bit_encoding();
     utf8_encoding = rb_utf8_encoding();
     id_join = rb_intern("join");
@@ -2028,6 +1501,9 @@ RUBY_FUNC_EXPORTED void Init_static_embeddings(void) {
     id_dim = rb_intern("dim");
     id_allow_unfrozen = rb_intern("allow_unfrozen");
 
+    id_validate_encoding = rb_intern("validate_encoding");
+    id_full = rb_intern("full");
+    id_prefix = rb_intern("prefix");
     mStaticEmbeddings = rb_define_module("StaticEmbeddings");
     cFiber = rb_const_get(rb_cObject, rb_intern("Fiber"));
 
@@ -2063,6 +1539,11 @@ RUBY_FUNC_EXPORTED void Init_static_embeddings(void) {
     rb_define_singleton_method(mStaticEmbeddings, "encode_f16", se_encode_f16, 1);
     rb_define_singleton_method(mStaticEmbeddings, "decode_f16", se_decode_f16, 1);
     rb_define_singleton_method(mStaticEmbeddings, "simd_backend", se_simd_backend, 0);
+#if SE_ENABLE_ALLOC_STATS
+    rb_define_singleton_method(mStaticEmbeddings, "__alloc_stats__", se_alloc_stats_hash, 0);
+    rb_define_singleton_method(mStaticEmbeddings, "__alloc_stats_reset__",
+                               se_alloc_stats_reset_bang, 0);
+#endif
 
     rb_define_const(mStaticEmbeddings, "FORMAT_VERSION", UINT2NUM(SE_FORMAT_VERSION));
     rb_define_const(mStaticEmbeddings, "TOKENIZER_BERT_WORDPIECE_V1",
