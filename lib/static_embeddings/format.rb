@@ -70,6 +70,8 @@ module StaticEmbeddings
       76 => :clean_text
     }.freeze
 
+    VERIFY_CHUNK_BYTES = 1024 * 1024
+
     module_function
 
     def hash_bytes(str, seed = HASH_SEED)
@@ -120,14 +122,28 @@ module StaticEmbeddings
     end
 
     def verify(path)
-      data = File.binread(path)
-      raise InvalidModelError, "file too small" if data.bytesize < HEADER_SIZE
-      raise InvalidModelError, "bad magic" unless data.byteslice(0, 8) == MAGIC.b
+      raise InvalidModelError, "file too small" if File.size(path) < HEADER_SIZE
 
-      stored = data.byteslice(CHECKSUM_OFFSET, CHECKSUM_SIZE)
-      actual = checksum_for_verify(data)
+      File.open(path, "rb") do |io|
+        header = io.read(HEADER_SIZE)
+        raise InvalidModelError, "bad magic" unless header.byteslice(0, 8) == MAGIC.b
 
-      { ok: stored == actual, expected: actual.unpack1("H*"), stored: stored.unpack1("H*") }
+        stored = header.byteslice(CHECKSUM_OFFSET, CHECKSUM_SIZE)
+        actual = streaming_checksum(io, header)
+
+        { ok: stored == actual, expected: actual.unpack1("H*"), stored: stored.unpack1("H*") }
+      end
+    end
+
+    def streaming_checksum(io, header)
+      digest = Digest::SHA256.new
+      zeroed = header.dup
+      zeroed[CHECKSUM_OFFSET, CHECKSUM_SIZE] = "\0".b * CHECKSUM_SIZE
+      digest << zeroed
+
+      buffer = String.new(capacity: VERIFY_CHUNK_BYTES)
+      digest << buffer while io.read(VERIFY_CHUNK_BYTES, buffer)
+      digest.digest
     end
 
     def binary_string(capacity = nil)
@@ -280,10 +296,5 @@ module StaticEmbeddings
       buffer[offset, 8] = [value & 0xFFFFFFFF, value >> 32].pack("V2")
     end
 
-    def checksum_for_verify(data)
-      zeroed = data.dup
-      zeroed[CHECKSUM_OFFSET, CHECKSUM_SIZE] = "\0".b * CHECKSUM_SIZE
-      Digest::SHA256.digest(zeroed)
-    end
   end
 end

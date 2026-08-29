@@ -15,11 +15,13 @@ def rss_kb
 end
 
 rss_start = rss_kb
+StaticEmbeddingsSample.alloc_stats_reset
 
 t0 = StaticEmbeddingsSample.monotonic
 model = StaticEmbeddings.load(path, verify: verify)
 t_load = StaticEmbeddingsSample.monotonic - t0
 rss_after_load = rss_kb
+load_alloc_stats = StaticEmbeddingsSample.alloc_stats_snapshot
 
 t0 = StaticEmbeddingsSample.monotonic
 first_blob = model.embed(text)
@@ -72,6 +74,13 @@ bytes_per_sec = t_warmup.zero? ? 0.0 : model.mapped_bytes / t_warmup
 puts "warmup_residency_ratio=#{format('%.2f', residency_ratio)}"
 puts "warmup_mapped_bytes_per_sec=#{format('%.0f', bytes_per_sec)}"
 puts "warmup_mapped_gb_per_sec=#{format('%.2f', bytes_per_sec / 1e9)}"
+StaticEmbeddingsSample.print_alloc_stats_table(load_alloc_stats, prefix: "c_alloc.load")
+StaticEmbeddingsSample.print_alloc_stats(prefix: "c_alloc.total")
+if StaticEmbeddingsSample.alloc_stats_enabled?
+  puts "c_alloc_note=model bytes are mmapped on POSIX, so the model_file category " \
+       "stays at zero there by design; on Windows the loader reads the file into the heap"
+end
+puts
 puts "page_cache_state=unknown"
 puts "page_cache_note=a true cold-start number requires dropping the OS page cache first " \
      "(macOS: sudo purge, Linux: echo 3 > /proc/sys/vm/drop_caches) and running this sample once"

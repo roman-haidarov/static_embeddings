@@ -55,9 +55,16 @@ end
 
 Rake::TestTask.new(:test) do |t|
   t.libs << "test" << "lib"
-  t.test_files = FileList["test/**/*_test.rb"]
+  t.test_files = FileList["test/**/*_test.rb"].exclude("test/cancellation_timing_test.rb")
+  t.warning = false
+end
+
+Rake::TestTask.new(:cancellation_timing) do |t|
+  t.libs << "test" << "lib"
+  t.test_files = ["test/cancellation_timing_test.rb"]
   t.warning = false
 end
 
 task test: %i[compile fixtures]
+task cancellation_timing: %i[compile fixtures]
 task default: %i[compile fixtures test]

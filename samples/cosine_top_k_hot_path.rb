@@ -17,7 +17,7 @@ query = model.embed("postgres ruby static embeddings vector search hot path", fo
 matrix = model.embed_batch(texts, format: format).freeze # frozen: required for lock-free concurrent scans
 StaticEmbeddingsSample.embedding_blob!(query, model, 1, "query", format: format)
 StaticEmbeddingsSample.embedding_blob!(matrix, model, rows, "matrix", format: format)
-native_grep = "StaticEmbeddings|static_embeddings|top_k_impl|topk_execute|dot_product_unrolled|row_sum_squares"
+native_grep = "StaticEmbeddings|static_embeddings|top_k_impl|se_topk_execute|se_dot_product|se_dot_and_row_sq"
 
 top_k = metric == "cosine" ? StaticEmbeddings.method(:cosine_top_k) : StaticEmbeddings.method(:dot_top_k)
 
@@ -43,7 +43,7 @@ StaticEmbeddingsSample.print_header(
     bytes_per_component: StaticEmbeddingsSample.bytes_per_component(format),
     matrix_bytes: matrix.bytesize,
     expected_hot_symbols: [
-      "top_k_impl / topk_execute",
+      "top_k_impl / se_topk_execute",
       "no tokenizer symbols should dominate this sample",
       "this isolates row scanning, dot products and top-k maintenance"
     ]

@@ -80,6 +80,7 @@ write_env() {
     echo "INPUT_BYTES=$default_input_bytes"
     echo "ROWS=$default_rows"
     echo "UNITS=$default_units"
+    echo "STATIC_EMBEDDINGS_ALLOC_STATS=${STATIC_EMBEDDINGS_ALLOC_STATS:-}"
     echo
     "${ruby_cmd[@]}" -v 2>/dev/null || true
     uname -a 2>/dev/null || true
@@ -246,7 +247,20 @@ write_env
 append_summary_header
 
 if [[ "${COMPILE:-1}" != "0" ]]; then
-  run_step "00_compile" "${rake_cmd[@]}" compile || failures=$((failures + 1))
+  if [[ "${STATIC_EMBEDDINGS_ALLOC_STATS:-}" == "1" ]]; then
+    run_step "00_compile" "${rake_cmd[@]}" clobber compile || failures=$((failures + 1))
+    run_step "00_alloc_stats_check" "${ruby_cmd[@]}" -Ilib -e 'require "static_embeddings"; abort "allocation stats build was not loaded" unless StaticEmbeddings.respond_to?(:__alloc_stats__) && StaticEmbeddings.respond_to?(:__alloc_stats_reset__)' || failures=$((failures + 1))
+    if [[ "$failures" -ne 0 ]]; then
+      echo "allocation stats build failed; see $out_dir/00_compile.log and $out_dir/00_alloc_stats_check.log"
+      exit 1
+    fi
+  else
+    run_step "00_compile" "${rake_cmd[@]}" compile || failures=$((failures + 1))
+  fi
+fi
+
+if [[ "${TEST:-1}" != "0" ]]; then
+  run_step "00_test" "${rake_cmd[@]}" test || failures=$((failures + 1))
 fi
 
 if ! model_path="$(detect_model)"; then

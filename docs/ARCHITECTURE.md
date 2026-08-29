@@ -24,6 +24,15 @@ Everything expensive, fragile or security-sensitive about reading third-party
 model files happens once, offline, in a language where it is easy to get
 right. What remains in C is a bounds-checked mmap and three loops.
 
+The C side is `se_format.c` (mmap and validation), `se_tokenizer.c`,
+`se_embed.c`, `se_unicode.c`, `se_f16.c` (half-precision codec and kernels),
+`se_topk.c`, `se_alloc_stats.c` (optional allocation counters), and
+`static_embeddings.c` for the Ruby bindings. Shared size arithmetic,
+`static_assert`s on the mmapped struct layouts and the big-endian rejection live
+in `se_internal.h`: the header fields are decoded little-endian explicitly, but
+the mmapped structures and the float matrix are read in native order, so a
+big-endian host is refused at load rather than silently misread.
+
 ## `.semb` v2
 
 Little-endian throughout. 320-byte header, then sections aligned to 64 bytes.
@@ -90,10 +99,23 @@ tries inspired by double-array trie libraries such as libdatrie:
 - `root_trie` for tokens that can start a word;
 - `continuation_trie` for `##token` entries stored without the `##` prefix.
 
-At runtime `append_wordpiece` walks the relevant trie once, records the longest
-terminal node and emits that token id. This matches the shape of WordPiece much
-better than exact hash lookup: longest-prefix matching is one forward pass
-rather than many candidate hashes and memcmps.
+At runtime `append_wordpiece` first tries the hash table for the whole word,
+which is the common case for in-vocabulary text, and falls back to walking the
+relevant trie once, recording the longest terminal node. Both halves earn their
+place: removing the hash pre-check made tokenization several times slower on
+ordinary text, and replacing the trie with repeated hash lookups by decreasing
+length made out-of-vocabulary words several times slower still.
+
+Normalization has an ASCII fast path. Below `0x80` the CJK, NFD, combining-mark
+and case-folding branches always resolve the same way, so those runs go through
+a 128-entry classification table instead of the full
+`emit_cleaned -> emit_stripped -> emit_lowered -> feed_token_cp` chain, and a
+word reserves its codepoint buffer once rather than once per character. The
+table is generated to agree with `is_control`, `se_is_ascii_whitespace` and
+`se_is_ascii_punct`, and `test/ascii_parity_test.rb` sweeps every byte in
+`0x00..0x7F` against the Ruby reference to keep it that way. That test exists
+because `U+007F DEL` was misclassified through 0.1.1 and every sampled test in
+the suite passed anyway.
 
 Loading a model still performs **zero runtime insertions**. It is `mmap` plus a
 validation pass over the hash table, trie node ranges and trie edge ordering.
@@ -224,6 +246,33 @@ not triple the cost.
 With `max_tokens: false` there is nothing to truncate and the whole input is
 copied.
 
+The window bounds tokenizing, not the whole call. Ruby has to answer whether the
+`String` is valid UTF-8, and `rb_enc_str_coderange` answers it for the whole
+`String` — an O(bytes) scan when Ruby has not computed a coderange yet, running
+before the prefix is even chosen. `validate_encoding: :prefix` skips that scan
+and leans on the fact that the C side already validates what it reads:
+`decode_one` rejects malformed UTF-8, and `se_prefix_boundary_len` returns 0
+when it cannot decode, which degrades to a full copy rather than reading out of
+bounds. So `:prefix` is memory-safe in every case; what it gives up is noticing
+invalid bytes the tokenizer never reaches. A cached coderange is always
+honoured, which keeps the cheap answer authoritative when Ruby already has one.
+
+## Mapping the model file
+
+POSIX uses `mmap` with `PROT_READ`/`MAP_PRIVATE`; Windows uses
+`CreateFileMapping` plus `MapViewOfFile`. Both give the same three properties
+the format was designed around: pages fault in lazily instead of being read up
+front, the page cache is shared between forked or sibling processes, and the
+runtime never owns a writable copy of the matrix. Windows previously read the
+file into the heap, which cost every process a private copy of the model and a
+full read before the first query.
+
+Windows keeps the heap path as a fallback when mapping fails, since some network
+filesystems refuse it, and `model->mapped` records which one was taken so
+`se_model_close` unmaps or frees correctly. `verify` is separate from loading and
+streams the file through SHA-256 in chunks, so checking an artifact never
+materialises it either.
+
 ## Concurrency
 
 Small calls run inline. Large `embed_batch` calls copy Ruby input into C-owned
@@ -239,8 +288,9 @@ job/application layer.
 
 Cancellation is cooperative: the tokenizer checks a flag every 1024 codepoints
 (counted by iteration, not by byte offset, so the interval does not depend on
-how wide the input's codepoints are), the pooling loop checks every 256 rows,
-and the top-k scan every 1024 rows. `unblock_cancel` sets that flag when Ruby
+how wide the input's codepoints are), and the ASCII fast path checks on the same
+cadence in bytes so a long ASCII run is no less interruptible. The pooling loop
+checks every 256 rows, and the top-k scan every 1024 rows. `unblock_cancel` sets that flag when Ruby
 interrupts a GVL-free region.
 
 No global mutable state exists in C. The model is immutable after load and

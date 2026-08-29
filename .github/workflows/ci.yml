@@ -23,6 +23,38 @@ jobs:
       - run: bundle exec rake compile
       - run: bundle exec rake test
 
+  parity_fuzz:
+    name: differential fuzz (native vs Reference)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+          bundler-cache: true
+      - run: bundle exec rake compile
+      - name: exhaustive ASCII parity and differential fuzz
+        env:
+          FUZZ_N: "50000"
+        run: bundle exec ruby -Ilib -Itest test/ascii_parity_test.rb
+      - name: second seed
+        env:
+          FUZZ_N: "50000"
+          FUZZ_SEED: "20260112"
+        run: bundle exec ruby -Ilib -Itest test/ascii_parity_test.rb -n /fuzz/
+
+  timing:
+    name: cancellation latency (timing-sensitive)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+          bundler-cache: true
+      - run: bundle exec rake cancellation_timing
+
   memory:
     runs-on: ubuntu-latest
     steps:
@@ -43,11 +75,47 @@ jobs:
         run: |
           cc -O2 -std=c99 -Wall -Wextra -Iext/static_embeddings \
             tools/memory_smoke.c \
+            ext/static_embeddings/se_f16.c \
+            ext/static_embeddings/se_topk.c \
             ext/static_embeddings/se_format.c \
             ext/static_embeddings/se_unicode.c \
             ext/static_embeddings/se_tokenizer.c \
             ext/static_embeddings/se_embed.c \
             -lm -o tmp/memory_smoke
+      - name: sanitizer smoke
+        run: |
+          cc -O1 -g -fno-omit-frame-pointer -std=c99 -Wall -Wextra \
+            -fsanitize=address,undefined -Iext/static_embeddings \
+            tools/memory_smoke.c \
+            ext/static_embeddings/se_f16.c \
+            ext/static_embeddings/se_topk.c \
+            ext/static_embeddings/se_format.c \
+            ext/static_embeddings/se_unicode.c \
+            ext/static_embeddings/se_tokenizer.c \
+            ext/static_embeddings/se_embed.c \
+            -lm -o tmp/memory_smoke_san
+          ASAN_OPTIONS=detect_leaks=0:strict_string_checks=1 \
+            UBSAN_OPTIONS=print_stacktrace=1 \
+            ./tmp/memory_smoke_san tmp/test-tiny.semb
+
+      - name: sanitizer smoke with allocation stats
+        run: |
+          cc -O1 -g -fno-omit-frame-pointer -std=c99 -Wall -Wextra \
+            -fsanitize=address,undefined -DSE_ENABLE_ALLOC_STATS=1 \
+            -Iext/static_embeddings \
+            tools/memory_smoke.c \
+            ext/static_embeddings/se_alloc_stats.c \
+            ext/static_embeddings/se_f16.c \
+            ext/static_embeddings/se_topk.c \
+            ext/static_embeddings/se_format.c \
+            ext/static_embeddings/se_unicode.c \
+            ext/static_embeddings/se_tokenizer.c \
+            ext/static_embeddings/se_embed.c \
+            -lm -o tmp/memory_smoke_san_stats
+          ASAN_OPTIONS=detect_leaks=1:strict_string_checks=1 \
+            UBSAN_OPTIONS=print_stacktrace=1 \
+            ./tmp/memory_smoke_san_stats tmp/test-tiny.semb
+
       - name: valgrind
         run: |
           valgrind --error-exitcode=1 \
@@ -55,6 +123,56 @@ jobs:
             --show-leak-kinds=definite \
             --errors-for-leak-kinds=definite \
             ./tmp/memory_smoke tmp/test-tiny.semb
+
+  alloc_stats:
+    name: suite against the instrumented allocator
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+          bundler-cache: true
+      - name: build with allocation counters
+        run: STATIC_EMBEDDINGS_ALLOC_STATS=1 bundle exec rake clobber compile
+      - name: confirm the instrumented build was loaded
+        run: |
+          bundle exec ruby -Ilib -e 'require "static_embeddings"; abort "allocation stats build was not loaded" unless StaticEmbeddings.respond_to?(:__alloc_stats__)'
+      - name: run the suite against it
+        run: STATIC_EMBEDDINGS_ALLOC_STATS=1 bundle exec rake test
+
+  windows_loader:
+    name: windows loader (cross-compile + wine)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+          bundler-cache: true
+      - run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64 wine64
+      - name: build fixture
+        run: |
+          bundle exec rake compile
+          ruby tools/make_fixture_model.rb
+          ruby -Ilib -e 'require "static_embeddings"; Dir.mkdir("tmp") unless Dir.exist?("tmp"); StaticEmbeddings.convert("test/fixtures/tiny-wordpiece", output_path: "tmp/test-tiny.semb", model_id: "fixture/tiny-wordpiece")'
+      - name: cross-compile for x86_64-w64-mingw32
+        run: |
+          x86_64-w64-mingw32-gcc -O2 -std=gnu99 -Wall -Wextra -Werror \
+            -Wno-unused-parameter -Iext/static_embeddings \
+            tools/memory_smoke.c \
+            ext/static_embeddings/se_alloc_stats.c \
+            ext/static_embeddings/se_f16.c \
+            ext/static_embeddings/se_topk.c \
+            ext/static_embeddings/se_format.c \
+            ext/static_embeddings/se_unicode.c \
+            ext/static_embeddings/se_tokenizer.c \
+            ext/static_embeddings/se_embed.c \
+            -lm -o tmp/memory_smoke.exe
+      - name: run it under wine
+        env:
+          WINEDEBUG: "-all"
+        run: wine tmp/memory_smoke.exe tmp/test-tiny.semb
 
   benchmark:
     runs-on: ubuntu-latest

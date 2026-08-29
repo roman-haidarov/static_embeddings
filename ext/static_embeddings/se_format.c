@@ -14,6 +14,8 @@
 #ifndef O_CLOEXEC
 #define O_CLOEXEC 0
 #endif
+#else
+#include <windows.h>
 #endif
 
 void se_error_clear(se_error_t *err) {
@@ -278,6 +280,68 @@ static se_status_t parse_trie(se_trie_t *trie, const uint8_t *base, struct secti
     return SE_OK;
 }
 
+static int valid_unicode_codepoint(uint32_t cp) {
+    return cp <= 0x10FFFFu && !(cp >= 0xD800u && cp <= 0xDFFFu);
+}
+
+static se_status_t validate_norm_map(const se_map_entry_t *entries, uint32_t count,
+                                     const char *name, se_error_t *err) {
+    uint32_t prev = 0;
+
+    for (uint32_t i = 0; i < count; i++) {
+        const se_map_entry_t *entry = &entries[i];
+        if (entry->len > SE_ARRAY_LEN(entry->out)) {
+            se_error_set(err, SE_ERR_INVALID_FORMAT, "%s map entry %u has len %u", name, i,
+                         entry->len);
+            return SE_ERR_INVALID_FORMAT;
+        }
+        if (!valid_unicode_codepoint(entry->cp)) {
+            se_error_set(err, SE_ERR_INVALID_FORMAT, "%s map entry %u has invalid codepoint", name,
+                         i);
+            return SE_ERR_INVALID_FORMAT;
+        }
+        for (uint32_t k = 0; k < entry->len; k++) {
+            if (!valid_unicode_codepoint(entry->out[k])) {
+                se_error_set(err, SE_ERR_INVALID_FORMAT,
+                             "%s map entry %u output %u is not a valid codepoint", name, i, k);
+                return SE_ERR_INVALID_FORMAT;
+            }
+        }
+        if (i && entry->cp <= prev) {
+            se_error_set(err, SE_ERR_INVALID_FORMAT, "%s map is not strictly sorted", name);
+            return SE_ERR_INVALID_FORMAT;
+        }
+        prev = entry->cp;
+    }
+
+    return SE_OK;
+}
+
+static se_status_t validate_norm_ranges(const se_range_t *ranges, uint32_t count, const char *name,
+                                        se_error_t *err) {
+    uint32_t prev_hi = 0;
+
+    for (uint32_t i = 0; i < count; i++) {
+        const se_range_t *range = &ranges[i];
+        if (!valid_unicode_codepoint(range->hi)) {
+            se_error_set(err, SE_ERR_INVALID_FORMAT, "%s range %u exceeds the Unicode range", name,
+                         i);
+            return SE_ERR_INVALID_FORMAT;
+        }
+        if (range->lo > range->hi) {
+            se_error_set(err, SE_ERR_INVALID_FORMAT, "%s range %u is inverted", name, i);
+            return SE_ERR_INVALID_FORMAT;
+        }
+        if (i && range->lo <= prev_hi) {
+            se_error_set(err, SE_ERR_INVALID_FORMAT, "%s ranges overlap or are unsorted", name);
+            return SE_ERR_INVALID_FORMAT;
+        }
+        prev_hi = range->hi;
+    }
+
+    return SE_OK;
+}
+
 static se_status_t parse_norm_tables(se_model_t *model, const uint8_t *base, struct section sec,
                                      se_error_t *err) {
     memset(&model->norm, 0, sizeof(model->norm));
@@ -338,66 +402,112 @@ static se_status_t parse_norm_tables(se_model_t *model, const uint8_t *base, str
     model->norm.whitespace = (const se_range_t *)cursor;
     model->norm.whitespace_count = n_ws;
 
-    const se_map_entry_t *maps[] = {model->norm.lower, model->norm.nfd};
-    const uint32_t map_counts[] = {model->norm.lower_count, model->norm.nfd_count};
-    const char *map_names[] = {"lower", "nfd"};
-    for (size_t table = 0; table < 2; table++) {
-        uint32_t prev = 0;
-        for (uint32_t i = 0; i < map_counts[table]; i++) {
-            const se_map_entry_t *entry = &maps[table][i];
-            if (entry->len > 4) {
-                se_error_set(err, SE_ERR_INVALID_FORMAT, "%s map entry %u has len %u",
-                             map_names[table], i, entry->len);
-                return SE_ERR_INVALID_FORMAT;
-            }
-            if (entry->cp > 0x10FFFFu || (entry->cp >= 0xD800u && entry->cp <= 0xDFFFu)) {
-                se_error_set(err, SE_ERR_INVALID_FORMAT, "%s map entry %u has invalid codepoint",
-                             map_names[table], i);
-                return SE_ERR_INVALID_FORMAT;
-            }
-            for (uint32_t k = 0; k < entry->len; k++) {
-                uint32_t out_cp = entry->out[k];
-                if (out_cp > 0x10FFFFu || (out_cp >= 0xD800u && out_cp <= 0xDFFFu)) {
-                    se_error_set(err, SE_ERR_INVALID_FORMAT,
-                                 "%s map entry %u output %u is not a valid codepoint",
-                                 map_names[table], i, k);
-                    return SE_ERR_INVALID_FORMAT;
-                }
-            }
-            if (i && entry->cp <= prev) {
-                se_error_set(err, SE_ERR_INVALID_FORMAT, "%s map is not strictly sorted",
-                             map_names[table]);
-                return SE_ERR_INVALID_FORMAT;
-            }
-            prev = entry->cp;
-        }
+    se_status_t rc = validate_norm_map(model->norm.lower, model->norm.lower_count, "lower", err);
+    if (rc != SE_OK)
+        return rc;
+    rc = validate_norm_map(model->norm.nfd, model->norm.nfd_count, "nfd", err);
+    if (rc != SE_OK)
+        return rc;
+    rc = validate_norm_ranges(model->norm.mn, model->norm.mn_count, "mn", err);
+    if (rc != SE_OK)
+        return rc;
+    rc = validate_norm_ranges(model->norm.punct, model->norm.punct_count, "punct", err);
+    if (rc != SE_OK)
+        return rc;
+    rc = validate_norm_ranges(model->norm.control, model->norm.control_count, "control", err);
+    if (rc != SE_OK)
+        return rc;
+    return validate_norm_ranges(model->norm.whitespace, model->norm.whitespace_count, "whitespace",
+                                err);
+}
+
+static se_status_t validate_vocab_hash(const se_model_t *model, struct section vocab_strings,
+                                       se_error_t *err) {
+    const se_meta_t *m = &model->meta;
+    size_t bitset_size = ((size_t)m->vocab_size + 7u) / 8u;
+    size_t seen_bytes = 0;
+    uint32_t filled = 0;
+    se_status_t rc = SE_OK;
+
+    if (!se_alloc_bytes(bitset_size, 1u, &seen_bytes)) {
+        se_error_set(err, SE_ERR_INVALID_FORMAT, "vocabulary size is too large");
+        return SE_ERR_INVALID_FORMAT;
     }
 
-    const se_range_t *ranges[] = {model->norm.mn, model->norm.punct, model->norm.control,
-                                  model->norm.whitespace};
-    const uint32_t range_counts[] = {model->norm.mn_count, model->norm.punct_count,
-                                     model->norm.control_count, model->norm.whitespace_count};
-    const char *range_names[] = {"mn", "punct", "control", "whitespace"};
-    for (size_t table = 0; table < 4; table++) {
-        uint32_t prev_hi = 0;
-        for (uint32_t i = 0; i < range_counts[table]; i++) {
-            const se_range_t *range = &ranges[table][i];
-            if (range->hi > 0x10FFFFu) {
-                se_error_set(err, SE_ERR_INVALID_FORMAT, "%s range %u exceeds the Unicode range",
-                             range_names[table], i);
+    uint8_t *seen = (uint8_t *)se_calloc(SE_ALLOC_FORMAT_VALIDATE, 1, seen_bytes);
+    if (!seen) {
+        se_error_set(err, SE_ERR_OOM, "out of memory while validating vocabulary hash");
+        return SE_ERR_OOM;
+    }
+
+    for (uint32_t i = 0; i < m->hash_table_size; i++) {
+        const se_vocab_slot_t *slot = &model->vocab_hash[i];
+        if (slot->token_id == SE_SLOT_EMPTY)
+            continue;
+        if (slot->token_id >= m->vocab_size) {
+            se_error_set(err, SE_ERR_INVALID_FORMAT, "slot %u has token id out of range", i);
+            rc = SE_ERR_INVALID_FORMAT;
+            goto done;
+        }
+        if ((uint64_t)slot->str_off + slot->str_len > vocab_strings.size) {
+            se_error_set(err, SE_ERR_INVALID_FORMAT, "slot %u points outside the string blob", i);
+            rc = SE_ERR_INVALID_FORMAT;
+            goto done;
+        }
+
+        uint8_t mask = (uint8_t)(1u << (slot->token_id & 7u));
+        uint8_t *byte = &seen[slot->token_id >> 3];
+        if (*byte & mask) {
+            se_error_set(err, SE_ERR_INVALID_FORMAT,
+                         "token id %u appears more than once in hash table", slot->token_id);
+            rc = SE_ERR_INVALID_FORMAT;
+            goto done;
+        }
+
+        *byte |= mask;
+        filled++;
+    }
+
+    if (filled != m->vocab_size) {
+        se_error_set(err, SE_ERR_INVALID_FORMAT, "hash table has %u filled slots, expected %u",
+                     filled, m->vocab_size);
+        rc = SE_ERR_INVALID_FORMAT;
+        goto done;
+    }
+
+    uint32_t unk_lookup = 0;
+    if (!se_vocab_lookup(model, (const uint8_t *)"[UNK]", 5, &unk_lookup) ||
+        unk_lookup != m->unk_id) {
+        se_error_set(err, SE_ERR_INVALID_FORMAT,
+                     "[UNK] is not reachable through the vocabulary hash");
+        rc = SE_ERR_INVALID_FORMAT;
+    }
+
+done:
+    se_free(seen);
+    return rc;
+}
+
+static se_status_t validate_hash_probe_limits(const se_model_t *model, se_error_t *err) {
+    const se_meta_t *m = &model->meta;
+    if (m->max_probe == 0)
+        return SE_OK;
+
+    uint32_t mask = m->hash_table_size - 1u;
+    for (uint32_t i = 0; i < m->hash_table_size; i++) {
+        const se_vocab_slot_t *slot = &model->vocab_hash[i];
+        if (slot->token_id == SE_SLOT_EMPTY)
+            continue;
+
+        uint32_t pos = slot->hash & mask;
+        uint32_t probes = 1;
+        while (pos != i) {
+            probes++;
+            pos = (pos + 1u) & mask;
+            if (probes > m->max_probe) {
+                se_error_set(err, SE_ERR_INVALID_FORMAT, "slot %u exceeds recorded max probe", i);
                 return SE_ERR_INVALID_FORMAT;
             }
-            if (range->lo > range->hi) {
-                se_error_set(err, SE_ERR_INVALID_FORMAT, "%s range %u is inverted",
-                             range_names[table], i);
-                return SE_ERR_INVALID_FORMAT;
-            }
-            if (i && range->lo <= prev_hi) {
-                se_error_set(err, SE_ERR_INVALID_FORMAT, "%s ranges overlap or are unsorted",
-                             range_names[table]);
-                return SE_ERR_INVALID_FORMAT;
-            }
-            prev_hi = range->hi;
         }
     }
 
@@ -407,6 +517,12 @@ static se_status_t parse_norm_tables(se_model_t *model, const uint8_t *base, str
 static se_status_t validate(se_model_t *model, se_error_t *err) {
     const uint8_t *base = (const uint8_t *)model->map_base;
     const uint64_t file_size = (uint64_t)model->map_size;
+
+    if (!se_host_is_little_endian()) {
+        se_error_set(err, SE_ERR_UNSUPPORTED_VERSION,
+                     "static_embeddings .semb files require a little-endian host");
+        return SE_ERR_UNSUPPORTED_VERSION;
+    }
 
     if (file_size < SE_HEADER_SIZE) {
         se_error_set(err, SE_ERR_INVALID_FORMAT, "file shorter than header");
@@ -553,8 +669,7 @@ static se_status_t validate(se_model_t *model, se_error_t *err) {
 
     const struct section sections[] = {vocab_strings, vocab_hash, embeddings, norm,
                                        provenance,    root_trie,  cont_trie};
-    se_status_t overlap_status =
-        validate_no_overlaps(sections, sizeof(sections) / sizeof(sections[0]), err);
+    se_status_t overlap_status = validate_no_overlaps(sections, SE_ARRAY_LEN(sections), err);
     if (overlap_status != SE_OK)
         return overlap_status;
 
@@ -585,74 +700,13 @@ static se_status_t validate(se_model_t *model, se_error_t *err) {
     model->provenance = provenance.size ? (const char *)(base + provenance.off) : NULL;
     model->provenance_size = (size_t)provenance.size;
 
-    size_t bitset_size = ((size_t)m->vocab_size + 7u) / 8u;
-    uint8_t *seen = (uint8_t *)calloc(bitset_size ? bitset_size : 1u, 1u);
-    if (!seen) {
-        se_error_set(err, SE_ERR_OOM, "out of memory while validating vocabulary hash");
-        return SE_ERR_OOM;
-    }
+    se_status_t hash_status = validate_vocab_hash(model, vocab_strings, err);
+    if (hash_status != SE_OK)
+        return hash_status;
 
-    uint32_t filled = 0;
-    for (uint32_t i = 0; i < m->hash_table_size; i++) {
-        const se_vocab_slot_t *slot = &model->vocab_hash[i];
-        if (slot->token_id == SE_SLOT_EMPTY)
-            continue;
-        if (slot->token_id >= m->vocab_size) {
-            free(seen);
-            se_error_set(err, SE_ERR_INVALID_FORMAT, "slot %u has token id out of range", i);
-            return SE_ERR_INVALID_FORMAT;
-        }
-        if ((uint64_t)slot->str_off + slot->str_len > vocab_strings.size) {
-            free(seen);
-            se_error_set(err, SE_ERR_INVALID_FORMAT, "slot %u points outside the string blob", i);
-            return SE_ERR_INVALID_FORMAT;
-        }
-        uint8_t mask = (uint8_t)(1u << (slot->token_id & 7u));
-        uint8_t *byte = &seen[slot->token_id >> 3];
-        if (*byte & mask) {
-            free(seen);
-            se_error_set(err, SE_ERR_INVALID_FORMAT,
-                         "token id %u appears more than once in hash table", slot->token_id);
-            return SE_ERR_INVALID_FORMAT;
-        }
-        *byte |= mask;
-        filled++;
-    }
-    free(seen);
-
-    if (filled != m->vocab_size) {
-        se_error_set(err, SE_ERR_INVALID_FORMAT, "hash table has %u filled slots, expected %u",
-                     filled, m->vocab_size);
-        return SE_ERR_INVALID_FORMAT;
-    }
-
-    uint32_t unk_lookup = 0;
-    if (!se_vocab_lookup(model, (const uint8_t *)"[UNK]", 5, &unk_lookup) ||
-        unk_lookup != m->unk_id) {
-        se_error_set(err, SE_ERR_INVALID_FORMAT,
-                     "[UNK] is not reachable through the vocabulary hash");
-        return SE_ERR_INVALID_FORMAT;
-    }
-
-    if (m->max_probe > 0) {
-        uint32_t mask = m->hash_table_size - 1u;
-        for (uint32_t i = 0; i < m->hash_table_size; i++) {
-            const se_vocab_slot_t *slot = &model->vocab_hash[i];
-            if (slot->token_id == SE_SLOT_EMPTY)
-                continue;
-            uint32_t pos = slot->hash & mask;
-            uint32_t probes = 1;
-            while (pos != i) {
-                probes++;
-                pos = (pos + 1u) & mask;
-                if (probes > m->max_probe) {
-                    se_error_set(err, SE_ERR_INVALID_FORMAT, "slot %u exceeds recorded max probe",
-                                 i);
-                    return SE_ERR_INVALID_FORMAT;
-                }
-            }
-        }
-    }
+    se_status_t probe_status = validate_hash_probe_limits(model, err);
+    if (probe_status != SE_OK)
+        return probe_status;
 
     se_status_t trie_status =
         parse_trie(&model->root_trie, base, root_trie, m->vocab_size, "root", err);
@@ -701,35 +755,65 @@ se_status_t se_model_open(se_model_t *model, const char *path, se_error_t *err) 
     model->map_size = (size_t)st.st_size;
     model->mapped = 1;
 #else
-    FILE *f = fopen(path, "rb");
-    if (!f) {
+    HANDLE file = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                              FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) {
         se_error_set(err, SE_ERR_IO, "cannot open %s", path);
         return SE_ERR_IO;
     }
-    fseek(f, 0, SEEK_END);
-    long size = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    if (size <= 0) {
-        fclose(f);
-        se_error_set(err, SE_ERR_IO, "empty file %s", path);
+
+    LARGE_INTEGER file_size;
+    if (!GetFileSizeEx(file, &file_size) || file_size.QuadPart <= 0) {
+        CloseHandle(file);
+        se_error_set(err, SE_ERR_IO, "cannot stat %s", path);
         return SE_ERR_IO;
     }
-    void *buf = malloc((size_t)size);
-    if (!buf) {
-        fclose(f);
-        se_error_set(err, SE_ERR_OOM, "out of memory");
-        return SE_ERR_OOM;
-    }
-    if (fread(buf, 1, (size_t)size, f) != (size_t)size) {
-        free(buf);
-        fclose(f);
-        se_error_set(err, SE_ERR_IO, "short read on %s", path);
+
+    if ((uint64_t)file_size.QuadPart > (uint64_t)SIZE_MAX) {
+        CloseHandle(file);
+        se_error_set(err, SE_ERR_IO, "file is too large to map safely");
         return SE_ERR_IO;
     }
-    fclose(f);
-    model->map_base = buf;
-    model->map_size = (size_t)size;
-    model->mapped = 0;
+
+    void *view = NULL;
+    HANDLE mapping = CreateFileMappingA(file, NULL, PAGE_READONLY, 0, 0, NULL);
+    if (mapping) {
+        view = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0);
+        CloseHandle(mapping);
+    }
+
+    if (view) {
+        CloseHandle(file);
+        model->map_base = view;
+        model->map_size = (size_t)file_size.QuadPart;
+        model->mapped = 1;
+    } else {
+        size_t size = (size_t)file_size.QuadPart;
+        void *buf = se_malloc(SE_ALLOC_MODEL_FILE, size);
+        if (!buf) {
+            CloseHandle(file);
+            se_error_set(err, SE_ERR_OOM, "out of memory");
+            return SE_ERR_OOM;
+        }
+
+        size_t got = 0;
+        while (got < size) {
+            DWORD chunk = (DWORD)((size - got) > 0x10000000u ? 0x10000000u : (size - got));
+            DWORD read = 0;
+            if (!ReadFile(file, (uint8_t *)buf + got, chunk, &read, NULL) || read == 0) {
+                se_free(buf);
+                CloseHandle(file);
+                se_error_set(err, SE_ERR_IO, "short read on %s", path);
+                return SE_ERR_IO;
+            }
+            got += read;
+        }
+
+        CloseHandle(file);
+        model->map_base = buf;
+        model->map_size = size;
+        model->mapped = 0;
+    }
 #endif
 
     se_status_t rc = validate(model, err);
@@ -747,9 +831,12 @@ void se_model_close(se_model_t *model) {
     if (model->mapped)
         munmap(model->map_base, model->map_size);
     else
-        free(model->map_base);
+        se_free(model->map_base);
 #else
-    free(model->map_base);
+    if (model->mapped)
+        UnmapViewOfFile(model->map_base);
+    else
+        se_free(model->map_base);
 #endif
     memset(model, 0, sizeof(*model));
 }

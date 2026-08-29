@@ -50,7 +50,13 @@ puts "count=#{count}"
 puts "elapsed=#{format('%.6f', elapsed)}"
 puts "ops_per_sec=#{format('%.6f', count / elapsed)}"
 puts "sec_per_op=#{format('%.6f', elapsed / [count, 1].max)}"
-puts "logical_input_mb_per_sec=#{format('%.3f', (count * text.bytesize) / elapsed / 1_000_000.0)}"
+StaticEmbeddingsSample.print_input_throughput(
+  name: "logical_input_mb_per_sec",
+  bytes: text.bytesize,
+  count: count,
+  elapsed: elapsed,
+  truncation_active: last.length >= model.max_tokens
+)
 puts "token_count=#{last.length}"
 puts "first_tokens=#{last.first(16).inspect}"
 puts "gc_delta=#{gc_delta}"
