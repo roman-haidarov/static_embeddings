@@ -45,6 +45,29 @@ module TestSupport
     @reference ||= StaticEmbeddings::Reference.from_source_dir(source_dir)
   end
 
+  def timing_sensitive_tests?
+    ENV["STATIC_EMBEDDINGS_TIMING_TESTS"] == "1"
+  end
+
+  def thread_ticks_during
+    ticks = 0
+    running = true
+    ticker = Thread.new do
+      while running
+        ticks += 1
+        Thread.pass
+      end
+    end
+
+    Thread.pass
+    before = ticks
+    yield
+    ticks - before
+  ensure
+    running = false
+    ticker&.join
+  end
+
   TRICKY_TEXTS = [
     "",
     " ",

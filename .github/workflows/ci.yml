@@ -124,6 +124,17 @@ jobs:
             --errors-for-leak-kinds=definite \
             ./tmp/memory_smoke tmp/test-tiny.semb
 
+  gc_compaction:
+    name: GC.compact
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+          bundler-cache: true
+      - run: bundle exec rake gc_compaction
+
   alloc_stats:
     name: suite against the instrumented allocator
     runs-on: ubuntu-latest
@@ -185,3 +196,8 @@ jobs:
       - run: bundle exec rake compile
       - run: bundle exec rake demo_model
       - run: ruby tools/benchmark.rb
+      - name: benchmark harness
+        env:
+          BENCH_REPEATS: "3"
+          BENCH_MIN_SECONDS: "0.05"
+        run: bundle exec rake benchmark

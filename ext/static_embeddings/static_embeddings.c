@@ -503,6 +503,51 @@ static VALUE lookup_option(VALUE opts, ID id) {
     return rb_hash_lookup2(opts, ID2SYM(id), Qundef);
 }
 
+typedef struct {
+    const ID *allowed;
+    size_t count;
+} keyword_check_t;
+
+static int reject_unknown_keyword_i(VALUE key, VALUE value, VALUE arg) {
+    const keyword_check_t *check = (const keyword_check_t *)arg;
+    (void)value;
+
+    if (!SYMBOL_P(key))
+        rb_raise(rb_eArgError, "keyword must be a Symbol");
+
+    ID id = SYM2ID(key);
+    for (size_t i = 0; i < check->count; i++) {
+        if (id == check->allowed[i])
+            return ST_CONTINUE;
+    }
+
+    VALUE names = rb_ary_new_capa((long)check->count);
+    for (size_t i = 0; i < check->count; i++)
+        rb_ary_push(names, rb_sprintf(":%s", rb_id2name(check->allowed[i])));
+
+    const char *name = rb_id2name(id);
+    rb_raise(rb_eArgError, "unknown keyword: :%s (accepted: %" PRIsVALUE ")", name ? name : "?",
+             rb_ary_join(names, rb_str_new_cstr(", ")));
+}
+
+static void check_keywords(VALUE opts, const ID *allowed, size_t count) {
+    if (NIL_P(opts))
+        return;
+    if (!RB_TYPE_P(opts, T_HASH))
+        rb_raise(rb_eArgError, "keywords must be a Hash");
+
+    keyword_check_t check;
+    check.allowed = allowed;
+    check.count = count;
+    rb_hash_foreach(opts, reject_unknown_keyword_i, (VALUE)&check);
+}
+
+#define SE_CHECK_KEYWORDS(opts, ...)                                                       \
+    do {                                                                                   \
+        const ID se_allowed_[] = {__VA_ARGS__};                                            \
+        check_keywords((opts), se_allowed_, sizeof(se_allowed_) / sizeof(se_allowed_[0])); \
+    } while (0)
+
 static void reject_parallel_threads(VALUE opts) {
     VALUE v = lookup_option(opts, id_threads);
     if (v == Qundef || v == Qnil)
@@ -867,6 +912,7 @@ static VALUE embed_batch_internal(VALUE self, VALUE texts, VALUE max_tokens_opt,
 static VALUE model_embed_batch(int argc, VALUE *argv, VALUE self) {
     VALUE texts, opts;
     rb_scan_args(argc, argv, "1:", &texts, &opts);
+    SE_CHECK_KEYWORDS(opts, id_max_tokens, id_format, id_validate_encoding, id_threads);
     reject_parallel_threads(opts);
 
     VALUE max_tokens = lookup_option(opts, id_max_tokens);
@@ -927,6 +973,7 @@ static VALUE embed_one_value(VALUE self, VALUE text, VALUE max_tokens_opt,
 static VALUE model_embed(int argc, VALUE *argv, VALUE self) {
     VALUE text, opts;
     rb_scan_args(argc, argv, "1:", &text, &opts);
+    SE_CHECK_KEYWORDS(opts, id_max_tokens, id_format, id_validate_encoding, id_threads);
     reject_parallel_threads(opts);
     return embed_one_value(self, text, lookup_option(opts, id_max_tokens),
                            resolve_vector_format(lookup_option(opts, id_format)),
@@ -937,6 +984,7 @@ static VALUE model_embed(int argc, VALUE *argv, VALUE self) {
 static VALUE model_embed_with_stats(int argc, VALUE *argv, VALUE self) {
     VALUE text, opts;
     rb_scan_args(argc, argv, "1:", &text, &opts);
+    SE_CHECK_KEYWORDS(opts, id_max_tokens, id_format, id_validate_encoding, id_threads);
     reject_parallel_threads(opts);
 
     se_token_stats_t stats;
@@ -956,6 +1004,7 @@ static VALUE model_embed_with_stats(int argc, VALUE *argv, VALUE self) {
 static VALUE model_tokenize(int argc, VALUE *argv, VALUE self) {
     VALUE text, opts;
     rb_scan_args(argc, argv, "1:", &text, &opts);
+    SE_CHECK_KEYWORDS(opts, id_max_tokens, id_validate_encoding);
 
     model_wrapper_t *w = get_model(self);
     Check_Type(text, T_STRING);
@@ -1168,6 +1217,7 @@ static VALUE embed_token_ids_value(VALUE self, VALUE ids_value, VALUE max_tokens
 static VALUE model_embed_token_ids(int argc, VALUE *argv, VALUE self) {
     VALUE ids_value, opts;
     rb_scan_args(argc, argv, "1:", &ids_value, &opts);
+    SE_CHECK_KEYWORDS(opts, id_max_tokens, id_format, id_threads);
     reject_parallel_threads(opts);
     return embed_token_ids_value(self, ids_value, lookup_option(opts, id_max_tokens),
                                  resolve_vector_format(lookup_option(opts, id_format)), NULL);
@@ -1176,6 +1226,7 @@ static VALUE model_embed_token_ids(int argc, VALUE *argv, VALUE self) {
 static VALUE model_embed_token_ids_with_stats(int argc, VALUE *argv, VALUE self) {
     VALUE ids_value, opts;
     rb_scan_args(argc, argv, "1:", &ids_value, &opts);
+    SE_CHECK_KEYWORDS(opts, id_max_tokens, id_format, id_threads);
     reject_parallel_threads(opts);
 
     se_token_stats_t stats;
@@ -1315,6 +1366,7 @@ static void topk_check_matrix(VALUE matrix, size_t matrix_bytes, se_vector_forma
 static VALUE top_k_impl(int argc, VALUE *argv, VALUE self, int cosine) {
     VALUE query, matrix, k_val, opts;
     rb_scan_args(argc, argv, "3:", &query, &matrix, &k_val, &opts);
+    SE_CHECK_KEYWORDS(opts, id_dim, id_format, id_allow_unfrozen);
     (void)self;
 
     Check_Type(query, T_STRING);

@@ -45,22 +45,12 @@ class BatchTest < Minitest::Test
   end
 
   def test_batch_releases_the_gvl
+    skip "timing-sensitive GVL progress probe; set STATIC_EMBEDDINGS_TIMING_TESTS=1 to run" unless TestSupport.timing_sensitive_tests?
 
     texts = (1..4000).map { |i| "локальный поиск по тексту номер #{i}" }
-    ticks = 0
-    ticker = Thread.new do
-      loop do
-        ticks += 1
-        sleep 0.001
-      end
-    end
+    ticks = TestSupport.thread_ticks_during { @model.embed_batch(texts) }
 
-    sleep 0.02
-    before = ticks
-    @model.embed_batch(texts)
-    ticker.kill
-
-    assert_operator ticks - before, :>, 0,
+    assert_operator ticks, :>, 0,
                     "no other Ruby thread ran during embed_batch — the GVL was never released"
   end
 

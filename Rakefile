@@ -59,6 +59,12 @@ Rake::TestTask.new(:test) do |t|
   t.warning = false
 end
 
+Rake::TestTask.new(:gc_compaction) do |t|
+  t.libs << "test" << "lib"
+  t.test_files = ["test/gc_compaction_test.rb"]
+  t.warning = false
+end
+
 Rake::TestTask.new(:cancellation_timing) do |t|
   t.libs << "test" << "lib"
   t.test_files = ["test/cancellation_timing_test.rb"]
@@ -67,4 +73,23 @@ end
 
 task test: %i[compile fixtures]
 task cancellation_timing: %i[compile fixtures]
+task gc_compaction: %i[compile fixtures]
+
+namespace :benchmark do
+  Dir[File.join(__dir__, "benchmark", "*.rb")].sort.each do |path|
+    name = File.basename(path, ".rb")
+    next if name.start_with?("_")
+
+    desc "Run benchmark/#{name}.rb (BENCH_MODEL=... to pick a model)"
+    task name => %i[compile fixtures] do
+      ruby path
+    end
+  end
+end
+
+desc "Run every benchmark"
+task benchmark: Dir[File.join(__dir__, "benchmark", "*.rb")]
+  .sort.map { |p| File.basename(p, ".rb") }
+  .reject { |n| n.start_with?("_") }
+  .map { |n| "benchmark:#{n}" }
 task default: %i[compile fixtures test]

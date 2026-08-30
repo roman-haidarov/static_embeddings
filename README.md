@@ -22,7 +22,8 @@ batch = model.embed_batch([
 ```
 
 New to the gem? Start with `GET_STARTED.md`. Design rationale is in
-`docs/ARCHITECTURE.md`.
+`docs/ARCHITECTURE.md`, and `docs/LIMITATIONS.md` is the short answer to "does
+it do X".
 
 ## Runtime contract
 
@@ -122,6 +123,9 @@ cached tokenization and for benchmarking pooling in isolation; it is not a
 faster path for ordinary text.
 
 ### `format: :f16`
+
+Unknown keywords raise. `embed(text, fromat: :f16)` is an `ArgumentError`
+naming the accepted keywords, not a silent f32 vector.
 
 `format:` selects the returned storage encoding only. The model always computes
 in float32. For a 512-dimensional model one vector goes from 2048 to 1024 bytes.
@@ -300,6 +304,8 @@ a test fixture and API demo, not a retrieval quality baseline.
 
 ```bash
 ruby tools/benchmark.rb                  # normalised performance budget
+bundle exec rake benchmark               # benchmark/, see docs/BENCHMARKING.md
+bundle exec rake gc_compaction           # GC.compact hardening
 bundle exec rake cancellation_timing     # timing-sensitive, excluded from rake test
 samples/run_all.sh                       # native hot-path probes; see samples/README.md
 ```
