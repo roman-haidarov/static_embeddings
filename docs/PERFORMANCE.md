@@ -72,6 +72,14 @@ for those. And the instrumentation is not free: about 13% on `tokenize`, 3% on
 `embed`, within noise on `embed_batch`. A run captured with it is not
 comparable to one captured without it.
 
+## Running the benchmarks
+
+`bundle exec rake benchmark`, or one at a time with `rake benchmark:core_paths`
+and `rake benchmark:gvl_threshold`. Generated text inputs are
+`valid_encoding?`-primed before timing, so these are cached-coderange hot-path
+numbers. Every row carries `spread_pct`, and a difference smaller than that is
+not a result. See `docs/BENCHMARKING.md`.
+
 ## Benchmark hygiene
 
 Three failure modes have bitten this repository already.

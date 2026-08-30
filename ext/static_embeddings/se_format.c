@@ -845,5 +845,8 @@ size_t se_model_memsize(const se_model_t *model) {
     if (!model)
         return 0;
 
+    if (model->mapped)
+        return sizeof(se_model_t);
+
     return sizeof(se_model_t) + model->map_size;
 }

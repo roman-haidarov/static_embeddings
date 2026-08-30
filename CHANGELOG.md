@@ -1,5 +1,81 @@
 # Changelog
 
+## 0.1.3 (unreleased)
+
+Hardening and tooling, mostly borrowed from the sibling `tg_geometry` gem after
+reading its C extension side by side with this one. No behaviour changes to
+tokenization, pooling or search: the differential fuzz digest against
+`StaticEmbeddings::Reference` is unchanged.
+
+### Fixed
+
+- **Unknown keywords are rejected instead of ignored.** `rb_hash_lookup2`
+  returns the default for an absent key, so every misspelled keyword used to be
+  silently dropped and the caller got a plausible wrong answer. Two cases were
+  actively dangerous: `embed(text, fromat: :f16)` returned a full-width f32
+  vector, and `embed_batch(texts, threds: 4)` slipped past the guard whose only
+  job is to say that `threads:` buys nothing. All eight keyword-accepting
+  methods now validate against a whitelist and name the accepted keywords in the
+  error.
+
+  ```ruby
+  model.embed("hi", fromat: :f16)
+  # ArgumentError: unknown keyword: :fromat
+  #   (accepted: :max_tokens, :format, :validate_encoding, :threads)
+  ```
+
+- **`memsize` no longer charges the mapped model to the Ruby heap.** A mapped
+  `.semb` is file-backed, shared between forked workers and reclaimable by the
+  kernel, but `ObjectSpace.memsize_of(model)` reported its full size, which fed
+  GC heuristics memory the VM could neither free nor account for. It now reports
+  only process-owned bytes; `mapped_bytes` still reports the mapping. The
+  Windows heap fallback really is process memory and is still counted.
+
+### Added
+
+- **`benchmark/` with a shared harness.** Iteration counts are calibrated so
+  every measurement runs for at least `BENCH_MIN_SECONDS`, repeats are taken,
+  the median is reported, and every row carries `spread_pct` — the best-to-worst
+  distance across repeats. This release exists partly because a 6% throughput
+  claim in 0.1.2 turned out to be inside that spread. `BENCH_FORMAT=kv` gives
+  machine-readable output. Run with `rake benchmark`. Inputs are
+  `valid_encoding?`-primed, so rows report `coderange=cached` and measure the
+  hot path rather than a string fresh from a file or a database.
+
+- **`benchmark/gvl_threshold.rb`.** `SE_GVL_UNLOCK_THRESHOLD` has never been
+  justified by data. The sweep measures both halves of the trade: on one x86-64
+  run the step at 2048 bytes cost about 32% latency and four extra allocations,
+  and it is also the point where a second Ruby thread starts making progress at
+  all. The constant is unchanged; now there is something to argue from.
+
+- **`benchmark/core_paths.rb`,** covering tokenize, single embed, batch embed,
+  pooling in isolation and top-k in both formats. It reports single-text embed
+  twice, once repeating one string and once rotating a corpus, because the gap
+  between them is the cache effect that makes hot-loop numbers unreproducible.
+
+- **`test/gc_compaction_test.rb` and a `gc_compaction` CI job.** `top_k`,
+  `embed` and `embed_batch` hand raw pointers into C and release the GVL, so
+  compaction moving Ruby objects would show up as wrong numbers rather than a
+  crash.
+
+  Getting this test to test anything took two corrections. It first used a
+  64-row matrix, which is 2 KiB against a 1 MiB `SE_TOPK_GVL_UNLOCK_THRESHOLD`,
+  so the scan never released the GVL and compaction could not interleave with
+  it. The same mistake then turned out to be hiding in the embed case: 2038
+  bytes of corpus against a 2048-byte `SE_GVL_UNLOCK_THRESHOLD`, ten bytes
+  under. Measured with a spinning neighbour thread, both old cases produced zero
+  ticks during the call and both fixed ones produce hundreds of millions. Every
+  concurrency case now asserts it is over the relevant threshold, because
+  without that assertion the test silently stops testing the moment a constant
+  or a fixture changes.
+
+- **`docs/LIMITATIONS.md`.** One page answering "does it do X", split into
+  decisions and unfinished work: no ANN index, no batched queries, no candidate
+  filtering, no int8, no Ractor, no internal parallelism, and so on.
+
+- **`docs/BENCHMARKING.md`,** covering how to read `spread_pct` and the four
+  measurement traps this repository has already fallen into.
+
 ## 0.1.2 (unreleased)
 
 A tokenizer correctness fix, the ASCII fast path it made safe to write, and an

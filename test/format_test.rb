@@ -42,6 +42,17 @@ class FormatTest < Minitest::Test
     end
   end
 
+  def test_memsize_excludes_the_mapping
+    require "objspace"
+    model = StaticEmbeddings.load(@path)
+
+    assert_operator model.mapped_bytes, :>, 0
+    assert_operator ObjectSpace.memsize_of(model), :<, model.mapped_bytes,
+                    "memsize should not charge the mmapped model to the Ruby heap"
+  ensure
+    model&.close
+  end
+
   def test_verify_does_not_hold_the_file_in_memory
     before = GC.stat(:total_allocated_objects)
     StaticEmbeddings.verify(@path)

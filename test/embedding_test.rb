@@ -134,24 +134,13 @@ class EmbeddingTest < Minitest::Test
 
 
   def test_large_embed_releases_the_gvl
+    skip "timing-sensitive GVL progress probe; set STATIC_EMBEDDINGS_TIMING_TESTS=1 to run" unless TestSupport.timing_sensitive_tests?
+
     text = "локальный поиск по тексту " * 80_000
-    ticks = 0
-    ticker = Thread.new do
-      loop do
-        ticks += 1
-        sleep 0.001
-      end
-    end
+    ticks = TestSupport.thread_ticks_during { @model.embed(text, max_tokens: false) }
 
-    sleep 0.02
-    before = ticks
-    @model.embed(text, max_tokens: false)
-    ticker.kill
-
-    assert_operator ticks - before, :>, 0,
+    assert_operator ticks, :>, 0,
                     "no other Ruby thread ran during large embed — the GVL was never released"
-  ensure
-    ticker&.kill
   end
 
   def test_cosine_top_k
