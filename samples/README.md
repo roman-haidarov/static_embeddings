@@ -88,4 +88,9 @@ tokenizer stops well before the end of the string. The processed figure is
 omitted when the corpus is degenerate enough that the measurement cannot be
 made, for example an all-OOV text whose vector does not depend on prefix length.
 
+Batch corpus samples also print `mean_tokens_per_text`, `unk_ratio` and
+`tokens_per_sec`, taken from `embed_with_stats` on a 64-text probe outside the
+timed loop. Quote those when comparing texts/s across `MODE=` values: a hashes
+corpus emits more tokens per text than ASCII of the same byte length.
+
 GC is enabled by default. See `docs/PERFORMANCE.md` before quoting `gc_delta`.

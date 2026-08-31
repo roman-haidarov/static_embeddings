@@ -133,12 +133,8 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    se_scratch_t scratch;
-    se_scratch_init(&scratch);
-
     float *out = (float *)calloc(model.meta.dim ? model.meta.dim : 1, sizeof(float));
     if (!out) {
-        se_scratch_free(&scratch);
         se_model_close(&model);
         return 1;
     }
@@ -155,23 +151,26 @@ int main(int argc, char **argv) {
 
     size_t count = sizeof(texts) / sizeof(texts[0]);
     for (size_t i = 0; i < count; i++) {
-        if (!se_scratch_reserve(&scratch, model.meta.dim)) {
+        se_scratch_t *scratch = se_scratch_acquire(model.meta.dim);
+        if (!scratch) {
             free(out);
-            se_scratch_free(&scratch);
+            se_scratch_drop_thread();
             se_model_close(&model);
             return 1;
         }
-        if (!embed_text(&model, &scratch, texts[i], out)) {
+        if (!embed_text(&model, scratch, texts[i], out)) {
+            se_scratch_release(scratch);
+            se_scratch_drop_thread();
             free(out);
-            se_scratch_free(&scratch);
             se_model_close(&model);
             return 1;
         }
+        se_scratch_release(scratch);
         double norm = norm_of(out, model.meta.dim);
         if (!(norm >= 0.0 && norm <= 1.0001)) {
             fprintf(stderr, "unexpected norm %f\n", norm);
+            se_scratch_drop_thread();
             free(out);
-            se_scratch_free(&scratch);
             se_model_close(&model);
             return 1;
         }
@@ -179,15 +178,15 @@ int main(int argc, char **argv) {
 
 #if SE_ENABLE_ALLOC_STATS
     if (!alloc_stats_expect_scratch_live()) {
+        se_scratch_drop_thread();
         free(out);
-        se_scratch_free(&scratch);
         se_model_close(&model);
         return 1;
     }
 #endif
 
+    se_scratch_drop_thread();
     free(out);
-    se_scratch_free(&scratch);
 
 #if SE_ENABLE_ALLOC_STATS
     if (!alloc_stats_expect_scratch_freed()) {

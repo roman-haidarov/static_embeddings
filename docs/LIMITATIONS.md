@@ -57,8 +57,10 @@ the entry says whether that is a decision or just unfinished work.
 ## Storage formats
 
 - **`f32` and `f16` only.** No int8, no binary quantisation.
-- **`f16` is a storage trade-off, not a speed feature.** See
-  `docs/PERFORMANCE.md`; it wins on some CPUs and loses on others.
+- **`f16` is a storage encoding, not a different model.** Top-k over an f16
+  matrix can be faster or slower than f32 depending on the decode kernel; see
+  `docs/PERFORMANCE.md`. `embed_batch(format: :f16)` still encodes the blob
+  with the scalar converter.
 - **`f16` rounding is half-up, not ties-to-even.** Blobs written by this gem can
   differ from NumPy or PyTorch by one ULP on exact halfway values.
 

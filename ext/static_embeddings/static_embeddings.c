@@ -274,10 +274,14 @@ static void batch_worker_run(batch_job_t *job, se_scratch_t *scratch) {
 
 static void *batch_execute(void *arg) {
     batch_job_t *job = (batch_job_t *)arg;
-    se_scratch_t scratch;
-    se_scratch_init(&scratch);
-    batch_worker_run(job, &scratch);
-    se_scratch_free(&scratch);
+    se_scratch_t *scratch = se_scratch_acquire(job->model->meta.dim);
+    if (!scratch) {
+        se_error_set(&job->error, SE_ERR_OOM, "out of memory while sizing scratch buffers");
+        job->failed = 1;
+        return NULL;
+    }
+    batch_worker_run(job, scratch);
+    se_scratch_release(scratch);
     return NULL;
 }
 
@@ -928,6 +932,32 @@ static VALUE embed_one_via_batch(VALUE self, VALUE text, VALUE max_tokens_opt,
     return embed_texts_internal(self, text, 0, 1, max_tokens_opt, format, validation, stats);
 }
 
+typedef struct {
+    se_scratch_t *scratch;
+    const se_model_t *model;
+    const uint8_t *input;
+    size_t input_len;
+    uint32_t max_tokens;
+    float *out;
+    se_token_stats_t *stats;
+    se_error_t err;
+    se_status_t rc;
+} embed_one_scratch_job_t;
+
+static VALUE embed_one_scratch_body(VALUE arg) {
+    embed_one_scratch_job_t *job = (embed_one_scratch_job_t *)(uintptr_t)arg;
+    job->rc = se_embed_one(job->model, job->scratch, job->input, job->input_len, job->max_tokens,
+                           job->out, job->stats, &job->err, NULL);
+    return Qnil;
+}
+
+static VALUE embed_one_scratch_ensure(VALUE arg) {
+    embed_one_scratch_job_t *job = (embed_one_scratch_job_t *)(uintptr_t)arg;
+    se_scratch_release(job->scratch);
+    job->scratch = NULL;
+    return Qnil;
+}
+
 static VALUE embed_one_value(VALUE self, VALUE text, VALUE max_tokens_opt,
                              se_vector_format_t format, se_encoding_validation_t validation,
                              se_token_stats_t *stats) {
@@ -947,25 +977,28 @@ static VALUE embed_one_value(VALUE self, VALUE text, VALUE max_tokens_opt,
     rb_enc_associate(result, binary_encoding);
     float *out = (float *)RSTRING_PTR(result);
 
-    se_scratch_t scratch;
-    se_scratch_init(&scratch);
-    if (!se_scratch_reserve(&scratch, dim)) {
-        se_scratch_free(&scratch);
-        rb_raise(rb_eNoMemError, "out of memory");
-    }
-
-    se_error_t err;
-    se_error_clear(&err);
     se_token_stats_t local_stats;
-    se_status_t rc =
-        se_embed_one(&w->model, &scratch, (const uint8_t *)RSTRING_PTR(text),
-                     (size_t)RSTRING_LEN(text), resolve_max_tokens(&w->model, max_tokens_opt), out,
-                     stats ? stats : &local_stats, &err, NULL);
-    se_scratch_free(&scratch);
-    RB_GC_GUARD(text);
+    embed_one_scratch_job_t job;
+    memset(&job, 0, sizeof(job));
+    job.model = &w->model;
+    job.input = (const uint8_t *)RSTRING_PTR(text);
+    job.input_len = (size_t)RSTRING_LEN(text);
+    job.max_tokens = resolve_max_tokens(&w->model, max_tokens_opt);
+    job.out = out;
+    job.stats = stats ? stats : &local_stats;
+    se_error_clear(&job.err);
 
-    if (rc != SE_OK)
-        raise_se(&err);
+    job.scratch = se_scratch_acquire(dim);
+    if (!job.scratch)
+        rb_raise(rb_eNoMemError, "out of memory");
+
+    rb_ensure(embed_one_scratch_body, (VALUE)(uintptr_t)&job, embed_one_scratch_ensure,
+              (VALUE)(uintptr_t)&job);
+    RB_GC_GUARD(text);
+    RB_GC_GUARD(result);
+
+    if (job.rc != SE_OK)
+        raise_se(&job.err);
 
     return result;
 }
@@ -1001,6 +1034,38 @@ static VALUE model_embed_with_stats(int argc, VALUE *argv, VALUE self) {
     return hash;
 }
 
+typedef struct {
+    se_scratch_t *scratch;
+    const se_model_t *model;
+    const uint8_t *input;
+    size_t input_len;
+    uint32_t max_tokens;
+    se_token_stats_t stats;
+    se_error_t err;
+    se_status_t rc;
+    VALUE ids;
+} tokenize_scratch_job_t;
+
+static VALUE tokenize_scratch_body(VALUE arg) {
+    tokenize_scratch_job_t *job = (tokenize_scratch_job_t *)(uintptr_t)arg;
+    job->rc = se_tokenize(job->model, job->scratch, job->input, job->input_len, job->max_tokens,
+                          &job->stats, &job->err, NULL);
+    if (job->rc != SE_OK)
+        return Qnil;
+
+    job->ids = rb_ary_new_capa((long)job->stats.token_count);
+    for (uint32_t i = 0; i < job->stats.token_count; i++)
+        rb_ary_push(job->ids, UINT2NUM(job->scratch->ids[i]));
+    return Qnil;
+}
+
+static VALUE tokenize_scratch_ensure(VALUE arg) {
+    tokenize_scratch_job_t *job = (tokenize_scratch_job_t *)(uintptr_t)arg;
+    se_scratch_release(job->scratch);
+    job->scratch = NULL;
+    return Qnil;
+}
+
 static VALUE model_tokenize(int argc, VALUE *argv, VALUE self) {
     VALUE text, opts;
     rb_scan_args(argc, argv, "1:", &text, &opts);
@@ -1011,32 +1076,27 @@ static VALUE model_tokenize(int argc, VALUE *argv, VALUE self) {
     check_text_encoding_mode(
         text, -1, resolve_encoding_validation(lookup_option(opts, id_validate_encoding)));
 
-    uint32_t max_tokens = resolve_max_tokens(&w->model, lookup_option(opts, id_max_tokens));
+    tokenize_scratch_job_t job;
+    memset(&job, 0, sizeof(job));
+    job.model = &w->model;
+    job.input = (const uint8_t *)RSTRING_PTR(text);
+    job.input_len = (size_t)RSTRING_LEN(text);
+    job.max_tokens = resolve_max_tokens(&w->model, lookup_option(opts, id_max_tokens));
+    job.ids = Qnil;
+    se_error_clear(&job.err);
 
-    se_scratch_t scratch;
-    se_scratch_init(&scratch);
-    if (!se_scratch_reserve(&scratch, w->model.meta.dim)) {
-        se_scratch_free(&scratch);
+    job.scratch = se_scratch_acquire(w->model.meta.dim);
+    if (!job.scratch)
         rb_raise(rb_eNoMemError, "out of memory");
-    }
 
-    se_token_stats_t stats;
-    se_error_t err;
-    se_error_clear(&err);
-    se_status_t rc = se_tokenize(&w->model, &scratch, (const uint8_t *)RSTRING_PTR(text),
-                                 (size_t)RSTRING_LEN(text), max_tokens, &stats, &err, NULL);
-    if (rc != SE_OK) {
-        se_scratch_free(&scratch);
-        raise_se(&err);
-    }
-
-    VALUE ids = rb_ary_new_capa((long)stats.token_count);
-    for (uint32_t i = 0; i < stats.token_count; i++)
-        rb_ary_push(ids, UINT2NUM(scratch.ids[i]));
-
-    se_scratch_free(&scratch);
+    rb_ensure(tokenize_scratch_body, (VALUE)(uintptr_t)&job, tokenize_scratch_ensure,
+              (VALUE)(uintptr_t)&job);
     RB_GC_GUARD(text);
-    return ids;
+
+    if (job.rc != SE_OK)
+        raise_se(&job.err);
+
+    return job.ids;
 }
 
 typedef struct {
@@ -1077,17 +1137,15 @@ static VALUE num2ull_at_value(VALUE arg) {
 
 static void *ids_execute(void *arg) {
     ids_job_t *job = (ids_job_t *)arg;
-    se_scratch_t scratch;
-    se_scratch_init(&scratch);
-    if (!se_scratch_reserve(&scratch, job->model->meta.dim)) {
+    se_scratch_t *scratch = se_scratch_acquire(job->model->meta.dim);
+    if (!scratch) {
         se_error_set(&job->error, SE_ERR_OOM, "out of memory while sizing scratch buffers");
-        se_scratch_free(&scratch);
         return NULL;
     }
     se_error_clear(&job->error);
-    se_embed_ids(job->model, &scratch, job->ids, job->n_ids, job->out, &job->stats, &job->error,
+    se_embed_ids(job->model, scratch, job->ids, job->n_ids, job->out, &job->stats, &job->error,
                  &job->cancelled);
-    se_scratch_free(&scratch);
+    se_scratch_release(scratch);
     return NULL;
 }
 

@@ -8,6 +8,7 @@
 #define SE_HAVE_NEON 1
 #elif defined(__SSE__)
 #include <xmmintrin.h>
+#include <emmintrin.h>
 #define SE_HAVE_SSE 1
 #endif
 
@@ -71,15 +72,49 @@ static void scale_copy(float *out, const float *acc, uint32_t dim, float inv) {
         out[j] = acc[j] * inv;
 }
 
-void se_l2_normalize(float *vec, uint32_t dim) {
+static double sum_sq_d(const float *vec, uint32_t dim) {
+    uint32_t j = 0;
     double sum = 0.0;
-    for (uint32_t j = 0; j < dim; j++)
+#if defined(SE_HAVE_NEON) && defined(__aarch64__)
+    float64x2_t s0 = vdupq_n_f64(0.0);
+    float64x2_t s1 = vdupq_n_f64(0.0);
+    for (; j + 7 < dim; j += 8) {
+        float32x4_t a = vld1q_f32(vec + j);
+        float32x4_t b = vld1q_f32(vec + j + 4);
+        float64x2_t a0 = vcvt_f64_f32(vget_low_f32(a));
+        float64x2_t a1 = vcvt_f64_f32(vget_high_f32(a));
+        float64x2_t b0 = vcvt_f64_f32(vget_low_f32(b));
+        float64x2_t b1 = vcvt_f64_f32(vget_high_f32(b));
+        s0 = vaddq_f64(s0, vmulq_f64(a0, a0));
+        s1 = vaddq_f64(s1, vmulq_f64(a1, a1));
+        s0 = vaddq_f64(s0, vmulq_f64(b0, b0));
+        s1 = vaddq_f64(s1, vmulq_f64(b1, b1));
+    }
+    sum = vaddvq_f64(vaddq_f64(s0, s1));
+#elif defined(SE_HAVE_SSE)
+    __m128d s0 = _mm_setzero_pd();
+    __m128d s1 = _mm_setzero_pd();
+    for (; j + 3 < dim; j += 4) {
+        __m128 v = _mm_loadu_ps(vec + j);
+        __m128d lo = _mm_cvtps_pd(v);
+        __m128d hi = _mm_cvtps_pd(_mm_movehl_ps(v, v));
+        s0 = _mm_add_pd(s0, _mm_mul_pd(lo, lo));
+        s1 = _mm_add_pd(s1, _mm_mul_pd(hi, hi));
+    }
+    double tmp[2];
+    _mm_storeu_pd(tmp, _mm_add_pd(s0, s1));
+    sum = tmp[0] + tmp[1];
+#endif
+    for (; j < dim; j++)
         sum += (double)vec[j] * (double)vec[j];
+    return sum;
+}
+
+void se_l2_normalize(float *vec, uint32_t dim) {
+    double sum = sum_sq_d(vec, dim);
     if (sum <= 0.0)
         return;
-    float inv = (float)(1.0 / sqrt(sum));
-    for (uint32_t j = 0; j < dim; j++)
-        vec[j] *= inv;
+    scale_copy(vec, vec, dim, (float)(1.0 / sqrt(sum)));
 }
 
 static se_status_t embed_ids_core(const se_model_t *model, se_scratch_t *sc, const uint32_t *ids,
@@ -128,8 +163,12 @@ static se_status_t embed_ids_core(const se_model_t *model, se_scratch_t *sc, con
     }
 
     if (model->meta.normalization_type == SE_NORMALIZATION_L2) {
-        scale_copy(out, acc, dim, 1.0f);
-        se_l2_normalize(out, dim);
+        double sum = sum_sq_d(acc, dim);
+        if (sum <= 0.0) {
+            memset(out, 0, (size_t)dim * sizeof(float));
+            return SE_OK;
+        }
+        scale_copy(out, acc, dim, (float)(1.0 / sqrt(sum)));
     } else {
         const float inv = 1.0f / (float)used;
         scale_copy(out, acc, dim, inv);
