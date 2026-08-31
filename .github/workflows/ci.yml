@@ -81,7 +81,7 @@ jobs:
             ext/static_embeddings/se_unicode.c \
             ext/static_embeddings/se_tokenizer.c \
             ext/static_embeddings/se_embed.c \
-            -lm -o tmp/memory_smoke
+            -lm -pthread -o tmp/memory_smoke
       - name: sanitizer smoke
         run: |
           cc -O1 -g -fno-omit-frame-pointer -std=c99 -Wall -Wextra \
@@ -93,7 +93,7 @@ jobs:
             ext/static_embeddings/se_unicode.c \
             ext/static_embeddings/se_tokenizer.c \
             ext/static_embeddings/se_embed.c \
-            -lm -o tmp/memory_smoke_san
+            -lm -pthread -o tmp/memory_smoke_san
           ASAN_OPTIONS=detect_leaks=0:strict_string_checks=1 \
             UBSAN_OPTIONS=print_stacktrace=1 \
             ./tmp/memory_smoke_san tmp/test-tiny.semb
@@ -111,7 +111,7 @@ jobs:
             ext/static_embeddings/se_unicode.c \
             ext/static_embeddings/se_tokenizer.c \
             ext/static_embeddings/se_embed.c \
-            -lm -o tmp/memory_smoke_san_stats
+            -lm -pthread -o tmp/memory_smoke_san_stats
           ASAN_OPTIONS=detect_leaks=1:strict_string_checks=1 \
             UBSAN_OPTIONS=print_stacktrace=1 \
             ./tmp/memory_smoke_san_stats tmp/test-tiny.semb

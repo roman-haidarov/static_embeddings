@@ -132,10 +132,11 @@ in float32. For a 512-dimensional model one vector goes from 2048 to 1024 bytes.
 It is accepted by `embed`, `embed_batch`, `embed_with_stats`, `embed_token_ids`,
 `embed_token_ids_with_stats`, `pack`, `unpack`, and the top-k helpers.
 
-Choose `f16` for the RAM and storage it saves, not for speed. It halves the
-bytes a top-k scan streams, but every row still has to be decoded before
-scoring, and which effect wins is a property of the machine — this repository's
-own samples show `f16` winning on x86-64 F16C and losing on M1 Pro. See
+Choose `f16` for the RAM and storage it saves; speed is a property of the
+machine and of the decode kernel. It halves the bytes a top-k scan streams, but
+every row still has to be decoded before scoring — this repository's own
+samples show `f16` winning on x86-64 F16C and, as of 0.1.4, on M1 Pro neon-fp16
+as well. On the lookup-table fallback it usually loses. See
 `docs/PERFORMANCE.md` before assuming either.
 
 `StaticEmbeddings.simd_backend` reports the live kernel: `"neon-fp16"`,
@@ -323,7 +324,7 @@ cc -O2 -std=c99 -Wall -Wextra -Iext/static_embeddings \
   ext/static_embeddings/se_unicode.c \
   ext/static_embeddings/se_tokenizer.c \
   ext/static_embeddings/se_embed.c \
-  -lm -o tmp/memory_smoke
+  -lm -pthread -o tmp/memory_smoke
 ./tmp/memory_smoke tmp/test-tiny.semb
 ```
 

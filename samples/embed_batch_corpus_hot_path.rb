@@ -11,6 +11,12 @@ count_texts = StaticEmbeddingsSample.env_int("TEXTS", 5_000)
 bytes_per_text = StaticEmbeddingsSample.env_int("BYTES_PER_TEXT", 192)
 texts = StaticEmbeddingsSample.corpus(mode, count_texts, bytes_per_text)
 total_input_bytes = texts.sum(&:bytesize)
+probe = texts.first(64)
+probe_stats = probe.map { |text| model.embed_with_stats(text) }
+probe_tokens = probe_stats.sum { |s| s.fetch(:token_count) }
+probe_unk = probe_stats.sum { |s| s.fetch(:unk_count) }
+mean_tokens_per_text = probe.empty? ? 0.0 : probe_tokens.to_f / probe.length
+unk_ratio = probe_tokens.zero? ? 0.0 : probe_unk.to_f / probe_tokens
 native_grep = "StaticEmbeddings|static_embeddings|model_embed_batch|embed_batch|batch_execute|se_embed_one|se_tokenize|normalize|append_wordpiece|wordpiece|se_vocab_lookup|se_hash_bytes|se_l2_normalize|unblock_cancel"
 
 StaticEmbeddingsSample.preheat(preheat_iterations) do
@@ -33,6 +39,9 @@ StaticEmbeddingsSample.print_header(
     texts: texts.length,
     total_input_bytes: total_input_bytes,
     bytes_per_text: bytes_per_text,
+    probe_texts: probe.length,
+    mean_tokens_per_text: format("%.3f", mean_tokens_per_text),
+    unk_ratio: format("%.6f", unk_ratio),
     expected_hot_symbols: [
       "model_embed_batch / embed_batch_internal / batch_execute",
       "se_embed_one / se_tokenize / normalize / append_wordpiece",
@@ -52,6 +61,9 @@ puts "count=#{batch_count}"
 puts "elapsed=#{format('%.6f', elapsed)}"
 puts "batches_per_sec=#{format('%.6f', batch_count / elapsed)}"
 puts "texts_per_sec=#{format('%.3f', embedded_texts / elapsed)}"
+puts "tokens_per_sec=#{format('%.3f', embedded_texts * mean_tokens_per_text / elapsed)}"
+puts "mean_tokens_per_text=#{format('%.3f', mean_tokens_per_text)}"
+puts "unk_ratio=#{format('%.6f', unk_ratio)}"
 puts "input_mb_per_sec=#{format('%.3f', embedded_bytes / elapsed / 1_000_000.0)}"
 puts "input_bytes_metric=logical"
 puts "output_bytes_per_batch=#{last&.bytesize}"

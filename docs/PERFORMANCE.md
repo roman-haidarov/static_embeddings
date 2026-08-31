@@ -22,33 +22,42 @@ ruby tools/benchmark.rb [model.semb]
 
 ## Where the time actually goes
 
-Tokenization dominates; pooling is a handful of row reads and adds. That is why
-the tokenizer is the file to profile, and why SIMD in the pooling loop is not
-where the wins are — that loop is memory-bound on random row lookups and the
-compiler already vectorises it.
+Which file to profile depends on the model and the text. On a short-dimension
+demo model, or on synthetic all-OOV input, tokenization dominates. On
+`potion-retrieval-32m` (`dim=512`) with in-vocabulary English, pooling is the
+larger share: each token is a random 2 KiB row add, and before 0.1.4 the scalar
+L2 pass showed up as about 19% of an ASCII `embed_batch` sample tree. SIMD in
+that L2 slot was a real win; another unroll of the add loop was not — it is
+memory-bound on those gathers, and the compiler already vectorises it.
 
-Out-of-vocabulary text is the main cliff. In-vocabulary words hit the
-vocabulary hash directly; everything else falls through to trie-driven subword
-splitting, which on a synthetic all-OOV corpus measured several times the
-per-text cost. Non-English input on an English model pays this on top of the
-`[UNK]` quality problem.
+Out-of-vocabulary text is the remaining tokenizer cliff. In-vocabulary words
+hit the vocabulary hash directly; everything else falls through to trie-driven
+subword splitting, which on a synthetic all-OOV corpus measured several times
+the per-text cost. Non-English input on an English model pays this on top of
+the `[UNK]` quality problem. Quote `mean_tokens_per_text` and `unk_ratio` from
+the batch samples before comparing texts/s across modes: hashes are slower
+than ASCII on this corpus mostly because they emit ~73 tokens/text against
+~31, not only because they miss the hash.
 
 ## `f16` is a storage trade-off
 
-`format: :f16` halves the bytes a top-k scan streams and doubles the decode
-work. Which one wins is a property of the machine, and this repository's own
-sample runs disagree with each other — same corpus, same `k`, native decode
-kernel in both cases:
+`format: :f16` halves the bytes a top-k scan streams and costs a decode per
+row. Which one wins is a property of the machine and of the decode kernel, and
+this repository's own sample runs disagree with each other — same corpus, same
+`k`, native decode kernel in both cases:
 
 ```text
                      f32        f16
-x86-64, f16c       3.00 ms    1.65 ms    f16 1.8x faster
-M1 Pro, neon-fp16  2.29 ms    2.88 ms    f16 1.3x slower
+x86-64, f16c       3.00 ms    1.65 ms    f16 1.8x faster   (F16C kernel, unchanged)
+M1 Pro, neon-fp16  2.36 ms    1.81 ms    f16 1.3x faster   (0.1.4, 16-wide NEON)
 ```
 
-Neither ratio transfers. Confirm `StaticEmbeddings.simd_backend`, then measure
-on the hardware you will run on. On the lookup-table fallback `f16` is usually
-slower than `f32`.
+The M1 Pro row in 0.1.3 was 2.29 / 2.88 ms, f16 1.3x *slower*, with an 8-wide
+decode. Neither ratio transfers. Confirm `StaticEmbeddings.simd_backend`, then
+measure on the hardware you will run on. On the lookup-table fallback `f16` is
+usually slower than `f32`. `embed_batch(format: :f16)` still encodes the
+returned blob with the scalar half converter, so a batch that is not a top-k
+scan can still be slower than `f32` on the same machine.
 
 ## C allocation counters
 

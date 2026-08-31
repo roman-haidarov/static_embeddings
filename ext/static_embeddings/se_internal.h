@@ -136,6 +136,12 @@ typedef struct {
     uint32_t control_count;
     const se_range_t *whitespace;
     uint32_t whitespace_count;
+    const se_map_entry_t *lower256[256];
+    const se_map_entry_t *nfd256[256];
+    uint8_t mn256[256];
+    uint8_t punct256[256];
+    uint8_t control256[256];
+    uint8_t whitespace256[256];
 } se_norm_tables_t;
 
 typedef struct {
@@ -382,6 +388,9 @@ static inline int se_is_ascii_boundary(uint32_t cp) {
 void se_scratch_init(se_scratch_t *s);
 void se_scratch_free(se_scratch_t *s);
 int se_scratch_reserve(se_scratch_t *s, uint32_t dim);
+se_scratch_t *se_scratch_acquire(uint32_t dim);
+void se_scratch_release(se_scratch_t *s);
+void se_scratch_drop_thread(void);
 
 size_t se_prefix_boundary_len(const se_model_t *model, const uint8_t *input, size_t input_len,
                               size_t target, size_t backscan);

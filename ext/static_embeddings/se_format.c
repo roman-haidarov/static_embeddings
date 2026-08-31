@@ -61,6 +61,34 @@ static uint32_t hash_bytes_continue(uint32_t h, const uint8_t *data, size_t len)
     return h;
 }
 
+static int se_memeq(const uint8_t *a, const uint8_t *b, size_t n) {
+    while (n >= 8) {
+        uint64_t ua, ub;
+        memcpy(&ua, a, 8);
+        memcpy(&ub, b, 8);
+        if (ua != ub)
+            return 0;
+        a += 8;
+        b += 8;
+        n -= 8;
+    }
+    if (n >= 4) {
+        uint32_t ua, ub;
+        memcpy(&ua, a, 4);
+        memcpy(&ub, b, 4);
+        if (ua != ub)
+            return 0;
+        a += 4;
+        b += 4;
+        n -= 4;
+    }
+    while (n--) {
+        if (*a++ != *b++)
+            return 0;
+    }
+    return 1;
+}
+
 int se_vocab_lookup_piece(const se_model_t *model, const uint8_t *prefix, size_t prefix_len,
                           const uint8_t *bytes, size_t len, uint32_t *id_out) {
     if (prefix_len > UINT32_MAX || len > UINT32_MAX || prefix_len > UINT32_MAX - len)
@@ -79,9 +107,9 @@ int se_vocab_lookup_piece(const se_model_t *model, const uint8_t *prefix, size_t
         if (slot->token_id == SE_SLOT_EMPTY)
             return 0;
         if (slot->hash == h && slot->str_len == total_len) {
-            const char *token = model->vocab_strings + slot->str_off;
-            if ((prefix_len == 0 || memcmp(token, prefix, prefix_len) == 0) &&
-                (len == 0 || memcmp(token + prefix_len, bytes, len) == 0)) {
+            const uint8_t *token = (const uint8_t *)(model->vocab_strings + slot->str_off);
+            if ((prefix_len == 0 || se_memeq(token, prefix, prefix_len)) &&
+                (len == 0 || se_memeq(token + prefix_len, bytes, len))) {
                 *id_out = slot->token_id;
                 return 1;
             }
@@ -102,6 +130,17 @@ static inline uint32_t trie_find_child(const se_trie_t *trie, const se_trie_node
 
     if (count == 0)
         return SE_SLOT_EMPTY;
+
+    if (count == 1)
+        return trie->edges[start].byte == byte ? trie->edges[start].child : SE_SLOT_EMPTY;
+
+    if (count == 2) {
+        if (trie->edges[start].byte == byte)
+            return trie->edges[start].child;
+        if (trie->edges[start + 1u].byte == byte)
+            return trie->edges[start + 1u].child;
+        return SE_SLOT_EMPTY;
+    }
 
     if (count <= 8) {
         for (uint32_t i = 0; i < count; i++) {
@@ -342,6 +381,37 @@ static se_status_t validate_norm_ranges(const se_range_t *ranges, uint32_t count
     return SE_OK;
 }
 
+static void fill_map256(const se_map_entry_t **out, const se_map_entry_t *entries, uint32_t count) {
+    memset(out, 0, 256 * sizeof(*out));
+    for (uint32_t i = 0; i < count; i++) {
+        if (entries[i].cp < 256)
+            out[entries[i].cp] = &entries[i];
+    }
+}
+
+static void fill_range256(uint8_t *out, const se_range_t *ranges, uint32_t count) {
+    memset(out, 0, 256);
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t lo = ranges[i].lo;
+        uint32_t hi = ranges[i].hi;
+        if (lo > 255)
+            continue;
+        if (hi > 255)
+            hi = 255;
+        for (uint32_t cp = lo; cp <= hi; cp++)
+            out[cp] = 1;
+    }
+}
+
+static void prepare_norm_fast_tables(se_model_t *model) {
+    fill_map256(model->norm.lower256, model->norm.lower, model->norm.lower_count);
+    fill_map256(model->norm.nfd256, model->norm.nfd, model->norm.nfd_count);
+    fill_range256(model->norm.mn256, model->norm.mn, model->norm.mn_count);
+    fill_range256(model->norm.punct256, model->norm.punct, model->norm.punct_count);
+    fill_range256(model->norm.control256, model->norm.control, model->norm.control_count);
+    fill_range256(model->norm.whitespace256, model->norm.whitespace, model->norm.whitespace_count);
+}
+
 static se_status_t parse_norm_tables(se_model_t *model, const uint8_t *base, struct section sec,
                                      se_error_t *err) {
     memset(&model->norm, 0, sizeof(model->norm));
@@ -417,8 +487,13 @@ static se_status_t parse_norm_tables(se_model_t *model, const uint8_t *base, str
     rc = validate_norm_ranges(model->norm.control, model->norm.control_count, "control", err);
     if (rc != SE_OK)
         return rc;
-    return validate_norm_ranges(model->norm.whitespace, model->norm.whitespace_count, "whitespace",
-                                err);
+    rc = validate_norm_ranges(model->norm.whitespace, model->norm.whitespace_count, "whitespace",
+                              err);
+    if (rc != SE_OK)
+        return rc;
+
+    prepare_norm_fast_tables(model);
+    return SE_OK;
 }
 
 static se_status_t validate_vocab_hash(const se_model_t *model, struct section vocab_strings,
