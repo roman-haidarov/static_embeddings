@@ -4,10 +4,12 @@
 
 Hot-path work in the C runtime. Token ids, the pooling contract and f16
 rounding are unchanged: the ASCII parity sweep and the differential fuzz
-digest against `StaticEmbeddings::Reference` still match, and the 0.1.3
-`model2vec.StaticModel` oracle still covers this runtime. L2 still
-accumulates sum-of-squares in double; 0.1.4 does that with SIMD pairwise
-adds, so a bit-identical match against a 0.1.3 vector is not promised.
+digest against `StaticEmbeddings::Reference` still match. The
+`model2vec.StaticModel` oracle was re-run for 0.1.4 against the same
+`potion-retrieval-32m` snapshot and `.semb` as 0.1.3: 31/31 id rows, 31/31
+vectors, `min_cosine=0.9999999999989528`, `max_abs_all=2.980232238769531e-07`
+— the same printed numbers as 0.1.3. L2 still accumulates sum-of-squares in
+double; 0.1.4 does that with SIMD pairwise adds.
 
 Measured on an M1 Pro, `potion-retrieval-32m`, `samples/run_all.sh`
 `DURATION=25`, production build (no alloc-stats). The 0.1.3 comparison run

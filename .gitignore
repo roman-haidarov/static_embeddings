@@ -3,6 +3,7 @@
 *.o
 *.log
 /tmp/
+/.venv-model2vec/
 /pkg/
 /.bundle/
 /lib/static_embeddings/static_embeddings.*
