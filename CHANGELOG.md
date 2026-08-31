@@ -1,5 +1,88 @@
 # Changelog
 
+## 0.1.4 (unreleased)
+
+Hot-path work in the C runtime. Token ids, the pooling contract and f16
+rounding are unchanged: the ASCII parity sweep and the differential fuzz
+digest against `StaticEmbeddings::Reference` still match, and the 0.1.3
+`model2vec.StaticModel` oracle still covers this runtime. L2 still
+accumulates sum-of-squares in double; 0.1.4 does that with SIMD pairwise
+adds, so a bit-identical match against a 0.1.3 vector is not promised.
+
+Measured on an M1 Pro, `potion-retrieval-32m`, `samples/run_all.sh`
+`DURATION=25`, production build (no alloc-stats). The 0.1.3 comparison run
+had `STATIC_EMBEDDINGS_ALLOC_STATS=1`, which the docs cost at about 3% on
+`embed` and 13% on `tokenize`; differences smaller than that, or inside the
+usual 5–10% laptop spread, are not claimed.
+
+### Changed
+
+- **L2 normalisation is a SIMD double reduction plus one scale into `out`.**
+  It used to `scale_copy` with `1.0` and then walk the vector twice in scalar
+  double. On this model `dim=512` and short in-vocabulary English, that L2
+  slot was about 19% of an ASCII `embed_batch` sample tree. The fused path
+  has a NEON/`__aarch64__` kernel and an SSE2 kernel; the scalar tail is
+  unchanged. ASCII batch went 307k → 338k texts/s on the M1 Pro (+10%). The
+  SSE2 path is compiled, not timed.
+
+- **The AArch64 f16 top-k kernel decodes 16 halves per iteration, not 8.**
+  The x86 F16C kernel is untouched. Same 50 000-row, `k=10`, ASCII matrix:
+
+  ```text
+                       f32        f16
+  x86-64, f16c       3.00 ms    1.65 ms    f16 1.8x faster   (0.1.2, F16C)
+  M1 Pro, neon-fp16  2.36 ms    1.81 ms    f16 1.3x faster   (0.1.4)
+  ```
+
+  The M1 Pro row used to read 2.29 / 2.88 ms, f16 1.3x *slower*. `docs/PERFORMANCE.md`
+  and the README follow the new numbers. On the lookup-table fallback f16 is
+  still usually slower than f32.
+
+- **Scratch buffers are reused per OS thread, and freed when the thread
+  exits.** `embed`, `tokenize`, `embed_batch` and `embed_token_ids` used to
+  `malloc`/`free` a scratch set on every call. A first cut of 0.1.4 used
+  `__thread` storage with no destructor, which leaked the heap buffers inside
+  the slot — bounded for a Puma pool, unbounded on the fiber-scheduler path
+  that `rb_thread_create`s one OS thread per large call. The slot is now a
+  `pthread_key` / `FlsAlloc` value whose destructor frees it. On release the
+  slot is trimmed back to the reserve sizes, so one `max_tokens: false`
+  document does not pin megabytes on that thread until process exit.
+  `tokenize` and the small `embed` path release the slot through `rb_ensure`,
+  so `rb_ary_push` raising cannot leave `in_use` stuck. `memory_smoke` calls
+  acquire/release so ASan/valgrind actually see this code.
+
+- **ASCII WordPiece copies an all-ASCII word as bytes** instead of
+  encoding UTF-8 through the codepoint buffer, then hashes and splits on the
+  trie with identity offsets. Output is the same ids. On the OOV tokenize
+  probes this is inside the run-to-run floor.
+
+- **Latin-1 (`U+0080..U+00FF`) lower/NFD/Mn/P/C/Zs tables are built at
+  load.** Codepoints below 256 skip the binary search into the mmap'd maps.
+  ASCII (`< 0x80`) still uses the existing 128-entry class table. Not visible
+  as texts/s on the English batch corpus.
+
+- **Vocabulary compare is an inline unaligned equality test** instead of
+  libc `memcmp`. Trie child lookup special-cases one- and two-edge nodes
+  before the linear/binary search. Same ids; no measured throughput claim.
+
+Two things were measured and not shipped. Unrolling `add_row` to 32 floats
+and stretching the prefetch distance to 8 cost about 13% on
+`random_pooling_hot_path` — that loop is already memory-bound on random 2 KiB
+row gathers. Walking the ASCII trie without `cps2` (`start += matched_len`)
+cost about 38% on the OOV tokenize probes.
+
+### Added
+
+- **Batch samples print `mean_tokens_per_text`, `unk_ratio` and
+  `tokens_per_sec`.** 307k vs 103k texts/s is not readable without token
+  density: on this corpus ASCII is 31 tokens/text and 0 unk, hashes 73 and 0,
+  unicode 68 and 4.4% unk.
+
+- **`test/scratch_tls_test.rb`.** When the instrumented allocator is loaded:
+  scratch bytes plateau across eight generations of helper threads, and a
+  large `max_tokens: false` embed must not leave the calling thread's slot
+  pinned. The `alloc_stats` CI job is what actually runs it.
+
 ## 0.1.3 (unreleased)
 
 Hardening and tooling, mostly borrowed from the sibling `tg_geometry` gem after

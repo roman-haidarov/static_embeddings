@@ -4,6 +4,18 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef _WIN32
+#include <pthread.h>
+#else
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0600
+#endif
+#include <windows.h>
+#endif
+
 #define SE_CANCEL_CHECK_MASK 0x3ffu
 
 void se_scratch_init(se_scratch_t *s) {
@@ -75,14 +87,18 @@ static int push_id(se_scratch_t *sc, size_t *n_ids, uint32_t id) {
     return 1;
 }
 
+#define SE_SCRATCH_CPS_KEEP   256
+#define SE_SCRATCH_IDS_KEEP   512
+#define SE_SCRATCH_BYTES_KEEP 1024
+
 int se_scratch_reserve(se_scratch_t *s, uint32_t dim) {
-    if (!grow_u32(&s->cps, &s->cps_cap, 256))
+    if (!grow_u32(&s->cps, &s->cps_cap, SE_SCRATCH_CPS_KEEP))
         return 0;
-    if (!grow_u32(&s->cps2, &s->cps2_cap, 256))
+    if (!grow_u32(&s->cps2, &s->cps2_cap, SE_SCRATCH_CPS_KEEP))
         return 0;
-    if (!grow_u32(&s->ids, &s->ids_cap, 256))
+    if (!grow_u32(&s->ids, &s->ids_cap, SE_SCRATCH_IDS_KEEP))
         return 0;
-    if (!grow_bytes(&s->bytes, &s->bytes_cap, 256))
+    if (!grow_bytes(&s->bytes, &s->bytes_cap, SE_SCRATCH_BYTES_KEEP))
         return 0;
     if (!grow_float(&s->acc, &s->acc_cap, dim))
         return 0;
@@ -90,21 +106,223 @@ int se_scratch_reserve(se_scratch_t *s, uint32_t dim) {
     return 1;
 }
 
+static int shrink_u32(uint32_t **buf, size_t *cap, size_t keep) {
+    size_t bytes = 0;
+    void *p;
+
+    if (*cap <= keep)
+        return 1;
+    if (!*buf) {
+        *cap = 0;
+        return 1;
+    }
+    if (!se_array_bytes(keep, sizeof(uint32_t), &bytes))
+        return 0;
+    p = se_realloc(SE_ALLOC_SCRATCH, *buf, bytes);
+    if (!p)
+        return 0;
+    *buf = (uint32_t *)p;
+    *cap = keep;
+    return 1;
+}
+
+static int shrink_bytes(uint8_t **buf, size_t *cap, size_t keep) {
+    size_t bytes = 0;
+    void *p;
+
+    if (*cap <= keep)
+        return 1;
+    if (!*buf) {
+        *cap = 0;
+        return 1;
+    }
+    if (!se_array_bytes(keep, sizeof(uint8_t), &bytes))
+        return 0;
+    p = se_realloc(SE_ALLOC_SCRATCH, *buf, bytes);
+    if (!p)
+        return 0;
+    *buf = (uint8_t *)p;
+    *cap = keep;
+    return 1;
+}
+
+static void se_scratch_trim(se_scratch_t *s) {
+    (void)shrink_u32(&s->cps, &s->cps_cap, SE_SCRATCH_CPS_KEEP);
+    (void)shrink_u32(&s->cps2, &s->cps2_cap, SE_SCRATCH_CPS_KEEP);
+    (void)shrink_u32(&s->ids, &s->ids_cap, SE_SCRATCH_IDS_KEEP);
+    (void)shrink_bytes(&s->bytes, &s->bytes_cap, SE_SCRATCH_BYTES_KEEP);
+}
+
+typedef struct {
+    se_scratch_t scratch;
+    int in_use;
+} se_tls_scratch_t;
+
+static void se_scratch_tls_dtor(void *p) {
+    se_tls_scratch_t *tls = (se_tls_scratch_t *)p;
+    if (!tls)
+        return;
+    se_scratch_free(&tls->scratch);
+    se_free(tls);
+}
+
+#ifndef _WIN32
+static pthread_key_t se_scratch_key;
+static pthread_once_t se_scratch_once = PTHREAD_ONCE_INIT;
+
+static void se_scratch_key_init(void) {
+    (void)pthread_key_create(&se_scratch_key, se_scratch_tls_dtor);
+}
+
+static se_tls_scratch_t *se_scratch_tls_get(void) {
+    (void)pthread_once(&se_scratch_once, se_scratch_key_init);
+    return (se_tls_scratch_t *)pthread_getspecific(se_scratch_key);
+}
+
+static se_tls_scratch_t *se_scratch_tls_slot(void) {
+    se_tls_scratch_t *tls = se_scratch_tls_get();
+    if (tls)
+        return tls;
+
+    tls = (se_tls_scratch_t *)se_malloc(SE_ALLOC_SCRATCH, sizeof(*tls));
+    if (!tls)
+        return NULL;
+    memset(tls, 0, sizeof(*tls));
+    se_scratch_init(&tls->scratch);
+    if (pthread_setspecific(se_scratch_key, tls) != 0) {
+        se_free(tls);
+        return NULL;
+    }
+    return tls;
+}
+
+static void se_scratch_tls_clear(void) {
+    se_tls_scratch_t *tls = se_scratch_tls_get();
+    if (!tls)
+        return;
+    (void)pthread_setspecific(se_scratch_key, NULL);
+    se_scratch_tls_dtor(tls);
+}
+#else
+static DWORD se_fls_index = FLS_OUT_OF_INDEXES;
+static INIT_ONCE se_fls_once = INIT_ONCE_STATIC_INIT;
+
+static VOID WINAPI se_scratch_fls_dtor(PVOID p) {
+    se_scratch_tls_dtor(p);
+}
+
+static BOOL CALLBACK se_scratch_fls_init(PINIT_ONCE once, PVOID param, PVOID *ctx) {
+    (void)once;
+    (void)param;
+    (void)ctx;
+    se_fls_index = FlsAlloc(se_scratch_fls_dtor);
+    return se_fls_index != FLS_OUT_OF_INDEXES;
+}
+
+static se_tls_scratch_t *se_scratch_tls_get(void) {
+    if (se_fls_index == FLS_OUT_OF_INDEXES)
+        return NULL;
+    return (se_tls_scratch_t *)FlsGetValue(se_fls_index);
+}
+
+static se_tls_scratch_t *se_scratch_tls_slot(void) {
+    if (!InitOnceExecuteOnce(&se_fls_once, se_scratch_fls_init, NULL, NULL) ||
+        se_fls_index == FLS_OUT_OF_INDEXES)
+        return NULL;
+
+    se_tls_scratch_t *tls = se_scratch_tls_get();
+    if (tls)
+        return tls;
+
+    tls = (se_tls_scratch_t *)se_malloc(SE_ALLOC_SCRATCH, sizeof(*tls));
+    if (!tls)
+        return NULL;
+    memset(tls, 0, sizeof(*tls));
+    se_scratch_init(&tls->scratch);
+    if (!FlsSetValue(se_fls_index, tls)) {
+        se_free(tls);
+        return NULL;
+    }
+    return tls;
+}
+
+static void se_scratch_tls_clear(void) {
+    se_tls_scratch_t *tls = se_scratch_tls_get();
+    if (!tls)
+        return;
+    (void)FlsSetValue(se_fls_index, NULL);
+    se_scratch_tls_dtor(tls);
+}
+#endif
+
+se_scratch_t *se_scratch_acquire(uint32_t dim) {
+    se_tls_scratch_t *tls = se_scratch_tls_slot();
+    if (!tls)
+        return NULL;
+
+    if (!tls->in_use) {
+        if (!se_scratch_reserve(&tls->scratch, dim))
+            return NULL;
+        tls->in_use = 1;
+        return &tls->scratch;
+    }
+
+    se_scratch_t *heap = (se_scratch_t *)se_malloc(SE_ALLOC_SCRATCH, sizeof(*heap));
+    if (!heap)
+        return NULL;
+    se_scratch_init(heap);
+    if (!se_scratch_reserve(heap, dim)) {
+        se_scratch_free(heap);
+        se_free(heap);
+        return NULL;
+    }
+    return heap;
+}
+
+void se_scratch_release(se_scratch_t *s) {
+    se_tls_scratch_t *tls;
+
+    if (!s)
+        return;
+
+    tls = se_scratch_tls_get();
+    if (tls && s == &tls->scratch) {
+        tls->in_use = 0;
+        se_scratch_trim(&tls->scratch);
+        return;
+    }
+    se_scratch_free(s);
+    se_free(s);
+}
+
+void se_scratch_drop_thread(void) {
+    se_tls_scratch_t *tls = se_scratch_tls_get();
+    if (tls && tls->in_use)
+        tls->in_use = 0;
+    se_scratch_tls_clear();
+}
+
 static int is_whitespace(const se_model_t *m, uint32_t cp) {
     if (cp < 0x80)
         return se_is_ascii_whitespace(cp);
+    if (cp < 256)
+        return m->norm.whitespace256[cp];
     return se_range_contains(m->norm.whitespace, m->norm.whitespace_count, cp);
 }
 
 static int is_control(const se_model_t *m, uint32_t cp) {
     if (cp < 0x80)
         return (cp < 0x20 || cp == 0x7f) && cp != '\t' && cp != '\n' && cp != '\r';
+    if (cp < 256)
+        return m->norm.control256[cp];
     return se_range_contains(m->norm.control, m->norm.control_count, cp);
 }
 
 static int is_punct(const se_model_t *m, uint32_t cp) {
     if (cp < 0x80)
         return se_is_ascii_punct(cp);
+    if (cp < 256)
+        return m->norm.punct256[cp];
     return se_range_contains(m->norm.punct, m->norm.punct_count, cp);
 }
 
@@ -154,12 +372,18 @@ static int decode_one(const uint8_t *src, size_t len, size_t *i, uint32_t *cp_ou
 static int normalization_stable(const se_model_t *m, uint32_t cp) {
     if (cp < 0x80)
         return 1;
-    if (m->meta.do_lower_case && se_map_lookup(m->norm.lower, m->norm.lower_count, cp))
-        return 0;
-    if (m->meta.strip_accents) {
-        if (se_map_lookup(m->norm.nfd, m->norm.nfd_count, cp))
+    if (m->meta.do_lower_case) {
+        const se_map_entry_t *lower =
+            cp < 256 ? m->norm.lower256[cp] : se_map_lookup(m->norm.lower, m->norm.lower_count, cp);
+        if (lower)
             return 0;
-        if (se_range_contains(m->norm.mn, m->norm.mn_count, cp))
+    }
+    if (m->meta.strip_accents) {
+        const se_map_entry_t *nfd =
+            cp < 256 ? m->norm.nfd256[cp] : se_map_lookup(m->norm.nfd, m->norm.nfd_count, cp);
+        if (nfd)
+            return 0;
+        if (cp < 256 ? m->norm.mn256[cp] : se_range_contains(m->norm.mn, m->norm.mn_count, cp))
             return 0;
     }
     return 1;
@@ -233,6 +457,7 @@ typedef struct {
     size_t n_ids;
     size_t n_unk;
     size_t segment_len;
+    int segment_ascii;
     se_token_stats_t *stats;
     se_error_t *err;
     volatile sig_atomic_t *cancelled;
@@ -248,6 +473,8 @@ static se_status_t oom(token_state_t *st, const char *where) {
 }
 
 static int append_segment_cp(token_state_t *st, uint32_t cp) {
+    if (cp >= 0x80)
+        st->segment_ascii = 0;
     if (!grow_u32(&st->scratch->cps, &st->scratch->cps_cap, st->segment_len + 1))
         return 0;
     st->scratch->cps[st->segment_len++] = cp;
@@ -272,7 +499,8 @@ static int cap_after_append(token_state_t *st) {
 typedef enum { WORDPIECE_OK = 1, WORDPIECE_OOM = 0, WORDPIECE_INVALID = -1 } wordpiece_status_t;
 
 static wordpiece_status_t wordpiece(const se_model_t *m, se_scratch_t *sc, const uint32_t *word,
-                                    size_t word_len, size_t *n_ids, size_t *n_unk) {
+                                    size_t word_len, size_t *n_ids, size_t *n_unk,
+                                    int known_ascii) {
     const se_meta_t *meta = &m->meta;
 
     if (word_len == 0)
@@ -285,30 +513,49 @@ static wordpiece_status_t wordpiece(const se_model_t *m, se_scratch_t *sc, const
         return 1;
     }
 
-    size_t bytes_need = 0;
-    if (!se_checked_mul_size(word_len, 4, &bytes_need) ||
-        !se_checked_add_size(bytes_need, 4, &bytes_need))
-        return 0;
-    if (!grow_bytes(&sc->bytes, &sc->bytes_cap, bytes_need))
-        return 0;
-    if (!grow_u32(&sc->cps2, &sc->cps2_cap, word_len + 1))
-        return 0;
-
-    size_t blen = 0;
-    for (size_t k = 0; k < word_len; k++) {
-        if (blen > UINT32_MAX)
-            return 0;
-        sc->cps2[k] = (uint32_t)blen;
-        uint32_t cp = word[k];
-        if (cp < 0x80) {
-            sc->bytes[blen++] = (uint8_t)cp;
-        } else {
-            blen += se_utf8_encode(cp, sc->bytes + blen);
+    int ascii_identity = known_ascii;
+    if (!ascii_identity) {
+        ascii_identity = 1;
+        for (size_t k = 0; k < word_len; k++) {
+            if (word[k] >= 0x80) {
+                ascii_identity = 0;
+                break;
+            }
         }
     }
-    if (blen > UINT32_MAX)
-        return 0;
-    sc->cps2[word_len] = (uint32_t)blen;
+
+    size_t blen = 0;
+    if (ascii_identity) {
+        if (!grow_bytes(&sc->bytes, &sc->bytes_cap, word_len))
+            return 0;
+        if (!grow_u32(&sc->cps2, &sc->cps2_cap, word_len + 1))
+            return 0;
+        for (size_t k = 0; k < word_len; k++) {
+            sc->bytes[k] = (uint8_t)word[k];
+            sc->cps2[k] = (uint32_t)k;
+        }
+        blen = word_len;
+        sc->cps2[word_len] = (uint32_t)word_len;
+    } else {
+        size_t bytes_need = 0;
+        if (!se_checked_mul_size(word_len, 4, &bytes_need) ||
+            !se_checked_add_size(bytes_need, 4, &bytes_need))
+            return 0;
+        if (!grow_bytes(&sc->bytes, &sc->bytes_cap, bytes_need))
+            return 0;
+        if (!grow_u32(&sc->cps2, &sc->cps2_cap, word_len + 1))
+            return 0;
+
+        for (size_t k = 0; k < word_len; k++) {
+            if (blen > UINT32_MAX)
+                return 0;
+            sc->cps2[k] = (uint32_t)blen;
+            blen += se_utf8_encode(word[k], sc->bytes + blen);
+        }
+        if (blen > UINT32_MAX)
+            return 0;
+        sc->cps2[word_len] = (uint32_t)blen;
+    }
 
     if (word_len <= meta->max_token_chars) {
         uint32_t exact_id = 0;
@@ -358,7 +605,8 @@ static wordpiece_status_t wordpiece(const se_model_t *m, se_scratch_t *sc, const
 static se_status_t append_wordpiece(token_state_t *st, const uint32_t *word, size_t word_len,
                                     int *stop) {
     wordpiece_status_t wp =
-        wordpiece(st->model, st->scratch, word, word_len, &st->n_ids, &st->n_unk);
+        wordpiece(st->model, st->scratch, word, word_len, &st->n_ids, &st->n_unk,
+                  word_len == 1 ? (word[0] < 0x80) : st->segment_ascii);
     if (wp == WORDPIECE_OOM)
         return oom(st, "tokenizing");
     if (wp == WORDPIECE_INVALID) {
@@ -375,6 +623,7 @@ static se_status_t flush_segment(token_state_t *st, int *stop) {
         return SE_OK;
     se_status_t rc = append_wordpiece(st, st->scratch->cps, st->segment_len, stop);
     st->segment_len = 0;
+    st->segment_ascii = 1;
     return rc;
 }
 
@@ -394,13 +643,30 @@ static se_status_t feed_token_cp(token_state_t *st, uint32_t cp, int *stop) {
     return SE_OK;
 }
 
+static const se_map_entry_t *lower_entry(const se_model_t *m, uint32_t cp) {
+    if (cp < 256)
+        return m->norm.lower256[cp];
+    return se_map_lookup(m->norm.lower, m->norm.lower_count, cp);
+}
+
+static const se_map_entry_t *nfd_entry(const se_model_t *m, uint32_t cp) {
+    if (cp < 256)
+        return m->norm.nfd256[cp];
+    return se_map_lookup(m->norm.nfd, m->norm.nfd_count, cp);
+}
+
+static int is_mn(const se_model_t *m, uint32_t cp) {
+    if (cp < 256)
+        return m->norm.mn256[cp];
+    return se_range_contains(m->norm.mn, m->norm.mn_count, cp);
+}
+
 static se_status_t emit_lowered(token_state_t *st, uint32_t cp, int *stop) {
     if (st->model->meta.do_lower_case) {
         if (cp >= 'A' && cp <= 'Z')
             cp += 32;
         else if (cp >= 0x80) {
-            const se_map_entry_t *e =
-                se_map_lookup(st->model->norm.lower, st->model->norm.lower_count, cp);
+            const se_map_entry_t *e = lower_entry(st->model, cp);
             if (e) {
                 for (uint32_t k = 0; k < e->len; k++) {
                     se_status_t rc = feed_token_cp(st, e->out[k], stop);
@@ -418,16 +684,16 @@ static se_status_t emit_stripped(token_state_t *st, uint32_t cp, int *stop) {
     if (!st->model->meta.strip_accents || cp < 0x80)
         return emit_lowered(st, cp, stop);
 
-    const se_map_entry_t *e = se_map_lookup(st->model->norm.nfd, st->model->norm.nfd_count, cp);
+    const se_map_entry_t *e = nfd_entry(st->model, cp);
     if (!e) {
-        if (se_range_contains(st->model->norm.mn, st->model->norm.mn_count, cp))
+        if (is_mn(st->model, cp))
             return SE_OK;
         return emit_lowered(st, cp, stop);
     }
 
     for (uint32_t k = 0; k < e->len; k++) {
         uint32_t d = e->out[k];
-        if (se_range_contains(st->model->norm.mn, st->model->norm.mn_count, d))
+        if (is_mn(st->model, d))
             continue;
         se_status_t rc = emit_lowered(st, d, stop);
         if (rc != SE_OK || *stop)
@@ -557,6 +823,7 @@ se_status_t se_tokenize(const se_model_t *model, se_scratch_t *sc, const uint8_t
     st.stats = stats;
     st.err = err;
     st.cancelled = cancelled;
+    st.segment_ascii = 1;
 
     size_t i = 0;
     size_t iterations = 0;

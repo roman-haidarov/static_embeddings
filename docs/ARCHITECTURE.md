@@ -174,10 +174,13 @@ storage/transport choice, not a different model. `embed_array` and
 
 The f32 compute path uses small explicit SIMD kernels where they keep the format
 simple: row accumulation and scaling use NEON/SSE when the compiler target
-exposes them, with scalar fallback everywhere else. `dot_top_k`/`cosine_top_k`
+exposes them, L2 sum-of-squares uses SIMD double (NEON on AArch64, SSE2 on
+x86) so the inverse stays a `1/sqrt` of a double accumulation, and there is a
+scalar fallback everywhere else. `dot_top_k`/`cosine_top_k`
 share the SIMD dot kernel for `format: :f32`; `cosine_top_k` additionally
 accumulates each row's sum of squares so it can divide by the true norms.
-`format: :f16` top-k decodes half components on the fly. What is still
+`format: :f16` top-k decodes half components on the fly (16-wide on AArch64
+NEON-FP16, 16-wide on x86 F16C). What is still
 deliberately absent is a dependency on BLAS: pooling is gathering random
 embedding rows, not a dense matrix multiply.
 
@@ -293,8 +296,13 @@ cadence in bytes so a long ASCII run is no less interruptible. The pooling loop
 checks every 256 rows, and the top-k scan every 1024 rows. `unblock_cancel` sets that flag when Ruby
 interrupts a GVL-free region.
 
-No global mutable state exists in C. The model is immutable after load and
-scratch buffers are per call.
+No global mutable state exists in C. The model is immutable after load.
+Scratch buffers are reused per OS thread via `pthread_key` / `FlsAlloc`, and
+the destructor frees them when the thread exits — including the short-lived
+threads the fiber scheduler path creates per large call. On release the slot
+is trimmed back to the reserve sizes, so a single unlimited-`max_tokens`
+document does not pin its working set until the thread dies. A nested call on
+the same thread allocates a one-off heap scratch that is freed on release.
 
 ## Where this fits in a RAG pipeline
 
