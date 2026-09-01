@@ -1,13 +1,25 @@
 require "json"
 require "digest"
+require "static_embeddings/format"
+require "static_embeddings/safetensors"
+require "static_embeddings/unicode_tables"
 
 module StaticEmbeddings
   class Converter
     REFERENCE_IMPL = "model2vec.StaticModel"
+    REFERENCE_MODEL2VEC_VERSION = "0.9.0"
+    REFERENCE_TOKENIZERS_VERSION = "0.23.1"
+    REFERENCE_UNICODE_CATEGORIES_VERSION = "0.1.1"
     REFERENCE_MAX_TOKENS = 512
 
     ALLOWED_NORMALIZER_KEYS = %w[type clean_text handle_chinese_chars strip_accents lowercase].freeze
-    STANDARD_SPECIAL_TOKENS = ["[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]"].freeze
+    STANDARD_SPECIAL_TOKENS = {
+      "[PAD]" => Format::ADDED_PAD,
+      "[UNK]" => Format::ADDED_UNK,
+      "[CLS]" => Format::ADDED_CLS,
+      "[SEP]" => Format::ADDED_SEP,
+      "[MASK]" => Format::ADDED_MASK
+    }.freeze
     SOURCE_FILES = %w[tokenizer.json config.json tokenizer_config.json model.safetensors].freeze
     TOKENIZER_PROFILE = "BERT_WORDPIECE_V1"
 
@@ -22,6 +34,7 @@ module StaticEmbeddings
       source = load_source
       profile = audit_tokenizer(source[:tokenizer], source[:tokenizer_config])
       tokens = extract_vocab(source[:tokenizer])
+      validate_added_token_ids!(profile[:added_tokens], tokens)
       matrix, dim = extract_matrix(tokens.length)
       meta = runtime_meta(source[:config], profile, tokens, max_tokens)
 
@@ -62,9 +75,13 @@ module StaticEmbeddings
       assert_wordpiece!(model)
       assert_normalizer!(normalizer)
       assert_pre_tokenizer!(pre_tokenizer)
-      audit_added_tokens(tokenizer)
+      added_tokens = audit_added_tokens(tokenizer)
 
       profile = profile_from(model, normalizer, tokenizer_config)
+      profile[:added_tokens] = added_tokens
+      profile[:added_token_mask] = added_tokens.reduce(0) do |mask, token|
+        mask | STANDARD_SPECIAL_TOKENS.fetch(token.fetch("content"))
+      end
       reject!("clean_text=false is not supported by the runtime") unless profile[:clean_text]
       profile
     end
@@ -123,17 +140,40 @@ module StaticEmbeddings
     def audit_added_tokens(tokenizer)
       added = tokenizer["added_tokens"] || []
       bad_content = added.reject { |token| standard_special?(token) }
-      reject!("tokenizer declares non-standard added_tokens #{bad_content.map { |t| t['content'] }.inspect}") unless bad_content.empty?
+      unless bad_content.empty?
+        reject!("tokenizer declares non-standard added_tokens #{bad_content.map { |t| t['content'] }.inspect}")
+      end
 
       whitespace = added.find { |token| token["content"].to_s.match?(/\s/) }
       reject!("added token #{whitespace['content'].inspect} contains whitespace") if whitespace
 
       flagged = added.find { |token| token["lstrip"] || token["rstrip"] || token["single_word"] }
       reject!("added token #{flagged['content'].inspect} uses lstrip/rstrip/single_word") if flagged
+
+      normalized = added.find { |token| token["normalized"] != false }
+      if normalized
+        reject!("added token #{normalized['content'].inspect} must use normalized=false")
+      end
+
+      duplicate = added.group_by { |token| token["content"] }.find { |_, rows| rows.length > 1 }
+      reject!("duplicate added token #{duplicate[0].inspect}") if duplicate
+
+      added
     end
 
     def standard_special?(token)
-      token["special"] && STANDARD_SPECIAL_TOKENS.include?(token["content"])
+      token["special"] && STANDARD_SPECIAL_TOKENS.key?(token["content"])
+    end
+
+    def validate_added_token_ids!(added_tokens, tokens)
+      added_tokens.each do |token|
+        content = token.fetch("content")
+        id = token["id"]
+        reject!("added token #{content.inspect} has non-integer id #{id.inspect}") unless id.is_a?(Integer)
+        unless id.between?(0, tokens.length - 1) && tokens[id] == content
+          reject!("added token #{content.inspect} id #{id} does not match model.vocab")
+        end
+      end
     end
 
     def extract_vocab(tokenizer)
@@ -159,7 +199,7 @@ module StaticEmbeddings
       path = File.join(source_dir, "model.safetensors")
       raise ConversionError, "missing model.safetensors in #{source_dir}" unless File.file?(path)
 
-      name, tensor = sole_matrix_tensor(Safetensors.read(path)[:tensors])
+      name, tensor = sole_matrix_tensor(Safetensors.describe(path)[:tensors])
       rows, dim = tensor[:shape]
       if rows != vocab_size
         raise ConversionError,
@@ -167,7 +207,7 @@ module StaticEmbeddings
               "#{vocab_size} tokens — refusing to guess the mapping"
       end
 
-      [tensor[:bytes], dim]
+      [Safetensors.f32_payload(path, tensor), dim]
     end
 
     def sole_matrix_tensor(tensors)
@@ -203,6 +243,7 @@ module StaticEmbeddings
         strip_accents: profile[:strip_accents],
         handle_chinese_chars: profile[:handle_chinese_chars],
         clean_text: profile[:clean_text],
+        added_token_mask: profile.fetch(:added_token_mask),
         max_input_chars_per_word: profile[:max_input_chars_per_word],
         max_token_chars: max_token_chars(tokens, profile[:continuing_subword_prefix]),
         subword_prefix: profile[:continuing_subword_prefix]
@@ -241,7 +282,7 @@ module StaticEmbeddings
     def source_digests
       SOURCE_FILES.each_with_object({}) do |name, acc|
         path = File.join(source_dir, name)
-        acc[name] = Digest::SHA256.hexdigest(File.binread(path)) if File.file?(path)
+        acc[name] = Digest::SHA256.file(path).hexdigest if File.file?(path)
       end
     end
 
@@ -252,6 +293,9 @@ module StaticEmbeddings
         "source_model_id" => model_id || File.basename(File.expand_path(source_dir)),
         "source_files_sha256" => source_digests,
         "reference_impl" => REFERENCE_IMPL,
+        "reference_model2vec_version" => REFERENCE_MODEL2VEC_VERSION,
+        "reference_tokenizers_version" => REFERENCE_TOKENIZERS_VERSION,
+        "reference_unicode_categories_version" => REFERENCE_UNICODE_CATEGORIES_VERSION,
         "reference_max_tokens" => meta[:max_tokens_default],
         "unicode_source" => UnicodeTables.source_stamp,
         "tokenizer_profile" => TOKENIZER_PROFILE,

@@ -32,8 +32,11 @@ never arbitrary HuggingFace models. A `.semb` file carries validated metadata, a
 BERT WordPiece tokenizer profile, an mmap-ready vocabulary lookup, float32
 embedding rows, and provenance plus a checksum.
 
-The only supported tokenizer profile is `BERT_WORDPIECE_V1`. The converter
-rejects unsupported tokenizer features rather than approximating them.
+The only supported tokenizer profile is `BERT_WORDPIECE_V1`, pinned for
+compatibility to `tokenizers 0.23.1`. The converter rejects unsupported
+tokenizer features rather than approximating them. `.semb` format v3 also
+records which of the five standard BERT added tokens are active. Files produced
+by 0.1.4 and earlier use format v2 and must be reconverted.
 
 ## Converting a model
 
@@ -56,6 +59,9 @@ model = StaticEmbeddings.load(ENV.fetch("EMBEDDING_MODEL"))   # explicit path
 
 Convert during image build or deploy preparation; production should only ever
 see `.semb` files.
+
+The offline converter accepts F32, F16 and BF16 safetensors embedding matrices;
+all three are converted to float32 rows in `.semb`.
 
 ### Verify once, not on every boot
 
@@ -98,6 +104,7 @@ stats = model.embed_with_stats("postgres pipeline mode in Ruby")
 stats[:vector]
 stats[:token_count]
 stats[:unk_count]
+stats[:pooled_count]  # rows actually eligible for pooling
 stats[:truncated]
 
 ids         = model.tokenize("postgres pipeline mode in Ruby")
@@ -116,11 +123,19 @@ Output is a binary `String` of little-endian float32 values in row-major order.
 `embed_array` and `embed_batch_arrays` decode that into Ruby `Float` objects and
 exist for debugging and application code, not for the hot path.
 
-`embed_token_ids` pools ids you supply, applying the same `max_tokens`
-truncation as `embed`, so `embed_token_ids(model.tokenize(text))` equals
-`embed(text)`. Pass `max_tokens: false` to pool every id. It is for reusing a
-cached tokenization and for benchmarking pooling in isolation; it is not a
-faster path for ordinary text.
+`tokenize` exposes raw WordPiece ids, including `[UNK]`, and its own
+`max_tokens` cap is therefore a raw-id cap. Embedding has a different, upstream
+pooling rule: for `UNK_DROP`, `[UNK]` is removed first and `max_tokens` is then
+applied to usable ids. To cache tokenization without changing the embedding,
+cache it unbounded:
+
+```ruby
+ids = model.tokenize(text, max_tokens: false)
+model.embed_token_ids(ids) == model.embed(text)
+```
+
+`embed_token_ids` applies that same usable-id cap. This distinction matters only
+when `[UNK]` appears around the truncation boundary.
 
 ### `format: :f16`
 
@@ -175,13 +190,13 @@ model.dot_top_k(query, MATRIX, 10)          # lock-free, concurrent, GVL release
 
 ## Large inputs
 
-When truncation is active the runtime does not copy the whole string into C
-memory. It copies a leading slice sized from `max_tokens`, cut on a word
-boundary, and grows the budget only if that slice did not reach `max_tokens`.
-The result is identical to tokenizing the whole document, because WordPiece
-segmentation is word-local, but the bytes the tokenizer reads stop growing with
-input size: with `max_tokens: 512` the window is a few kilobytes whether the
-document is 10 KB or 3 MB.
+When truncation is active the runtime starts with a leading slice sized from
+`max_tokens`, cut on a word boundary, and grows the budget until it has reached
+`max_tokens` **usable** ids. For ordinary in-vocabulary text this keeps the
+tokenized prefix to a few kilobytes even when the document is megabytes long.
+For OOV-heavy input it may scan farther — or the whole string — because `[UNK]`
+no longer consumes the usable-token budget. That is required for the corrected
+UNK-before-truncate contract.
 
 That bounds the tokenizer, not the whole call. `embed` also has to establish
 that the Ruby `String` is valid UTF-8, and when Ruby has not computed the
@@ -273,22 +288,34 @@ subword splitting instead of hitting the vocabulary directly.
 
 ## Correctness contract
 
-The reference implementation is `model2vec.StaticModel`. The converter records
-its decisions in the `.semb` file: truncation at 512 tokens by default, applied
-after tokenization and before pooling; `[UNK]` tokens dropped; a zero vector for
-input with no usable tokens; L2 normalization when the source model requires it.
+0.1.5 separates contracts that 0.1.4 accidentally mixed together:
 
-Token ids must match the reference exactly. Vectors are compared with tolerance,
-because floating-point addition order is not bit-stable across implementations:
+- `tokenize` matches the pinned Hugging Face `tokenizers 0.23.1` raw
+  `BertNormalizer + BertPreTokenizer + WordPiece` ids, including the supported
+  `normalized: false` standard added tokens and `[UNK]`.
+- Embedding drops `[UNK]` when the model records `UNK_DROP`, then applies
+  `max_tokens` to the remaining usable ids, mean-pools, and performs source-model
+  L2 normalization.
+- The gem intentionally does **not** reproduce Model2Vec 0.9.0's character
+  pre-cut (`max_length * median_token_length`). Here `max_tokens` means actual
+  usable tokenizer ids. The oracle reports rows affected by this difference
+  separately instead of calling them parity.
+
+Where the execution contracts are the same, vectors are compared to
+`model2vec.StaticModel` with:
 
 ```text
 cosine >= 1 - 1e-6
 max_abs_diff < 1e-5
 ```
 
-`docs/MODEL_AUDIT.md` records the parity result, digests and edge-case
-behaviour for every trusted conversion, and the command to reproduce it. A new
-conversion is not trusted until it has its own record.
+The committed boundary generator currently produces 434 systematic rows. CI
+generates their oracle from pinned Python packages both on the deterministic
+fixture and on the pinned `potion-retrieval-32M` snapshot. The Ruby `Reference`
+fuzz is kept as a separate C-vs-Ruby implementation check and is not treated as
+proof of upstream compatibility. `docs/MODEL_AUDIT.md` records per-model audits;
+a corpus pass means exactly that corpus passed, not an exhaustive proof of all
+Unicode/tokenizer behavior.
 
 ## Development
 

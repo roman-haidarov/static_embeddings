@@ -60,6 +60,20 @@ class ConverterTest < Minitest::Test
     end
   end
 
+  def test_rejects_standard_added_token_that_is_normalized
+    error = assert_raises(StaticEmbeddings::UnsupportedModelError) do
+      with_modified_tokenizer { |t| t["added_tokens"].last["normalized"] = true }
+    end
+    assert_match(/normalized=false/, error.message)
+  end
+
+  def test_rejects_standard_added_token_with_wrong_vocab_id
+    error = assert_raises(StaticEmbeddings::UnsupportedModelError) do
+      with_modified_tokenizer { |t| t["added_tokens"].last["id"] = 3 }
+    end
+    assert_match(/model\.vocab/, error.message)
+  end
+
   def test_rejects_added_token_with_lstrip
     assert_raises(StaticEmbeddings::UnsupportedModelError) do
       with_modified_tokenizer { |t| t["added_tokens"].first["lstrip"] = true }

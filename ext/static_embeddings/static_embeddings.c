@@ -80,6 +80,7 @@ static ID id_blocking_p;
 static ID id_vector;
 static ID id_token_count;
 static ID id_unk_count;
+static ID id_pooled_count;
 static ID id_truncated;
 static ID id_dim;
 static ID id_allow_unfrozen;
@@ -1030,6 +1031,10 @@ static VALUE model_embed_with_stats(int argc, VALUE *argv, VALUE self) {
     rb_hash_aset(hash, ID2SYM(id_vector), vector);
     rb_hash_aset(hash, ID2SYM(id_token_count), UINT2NUM(stats.token_count));
     rb_hash_aset(hash, ID2SYM(id_unk_count), UINT2NUM(stats.unk_count));
+    uint32_t pooled_count = get_model(self)->model.meta.unk_policy == SE_UNK_DROP
+                                ? stats.token_count - stats.unk_count
+                                : stats.token_count;
+    rb_hash_aset(hash, ID2SYM(id_pooled_count), UINT2NUM(pooled_count));
     rb_hash_aset(hash, ID2SYM(id_truncated), stats.truncated ? Qtrue : Qfalse);
     return hash;
 }
@@ -1049,7 +1054,7 @@ typedef struct {
 static VALUE tokenize_scratch_body(VALUE arg) {
     tokenize_scratch_job_t *job = (tokenize_scratch_job_t *)(uintptr_t)arg;
     job->rc = se_tokenize(job->model, job->scratch, job->input, job->input_len, job->max_tokens,
-                          &job->stats, &job->err, NULL);
+                          SE_TOKEN_LIMIT_RAW, &job->stats, &job->err, NULL);
     if (job->rc != SE_OK)
         return Qnil;
 
@@ -1237,7 +1242,27 @@ static VALUE embed_token_ids_value(VALUE self, VALUE ids_value, VALUE max_tokens
     size_t n = (size_t)n_long;
     int truncated = 0;
 
-    if (max_tokens != 0 && n > (size_t)max_tokens) {
+    if (max_tokens != 0 && w->model.meta.unk_policy == SE_UNK_DROP) {
+        size_t usable = 0;
+        size_t cutoff = n;
+        for (size_t i = 0; i < n; i++) {
+            unsigned long long value = NUM2ULL(rb_ary_entry(ids_value, (long)i));
+            if (value >= w->model.meta.vocab_size)
+                rb_raise(rb_eArgError, "token id at index %zu is out of range", i);
+
+            if ((uint32_t)value == w->model.meta.unk_id)
+                continue;
+
+            usable++;
+            if (usable == (size_t)max_tokens) {
+                cutoff = i + 1;
+            } else if (usable > (size_t)max_tokens) {
+                n = cutoff;
+                truncated = 1;
+                break;
+            }
+        }
+    } else if (max_tokens != 0 && n > (size_t)max_tokens) {
         n = (size_t)max_tokens;
         truncated = 1;
     }
@@ -1297,6 +1322,10 @@ static VALUE model_embed_token_ids_with_stats(int argc, VALUE *argv, VALUE self)
     rb_hash_aset(hash, ID2SYM(id_vector), vector);
     rb_hash_aset(hash, ID2SYM(id_token_count), UINT2NUM(stats.token_count));
     rb_hash_aset(hash, ID2SYM(id_unk_count), UINT2NUM(stats.unk_count));
+    uint32_t pooled_count = get_model(self)->model.meta.unk_policy == SE_UNK_DROP
+                                ? stats.token_count - stats.unk_count
+                                : stats.token_count;
+    rb_hash_aset(hash, ID2SYM(id_pooled_count), UINT2NUM(pooled_count));
     rb_hash_aset(hash, ID2SYM(id_truncated), stats.truncated ? Qtrue : Qfalse);
     return hash;
 }
@@ -1607,6 +1636,7 @@ RUBY_FUNC_EXPORTED void Init_static_embeddings(void) {
     id_vector = rb_intern("vector");
     id_token_count = rb_intern("token_count");
     id_unk_count = rb_intern("unk_count");
+    id_pooled_count = rb_intern("pooled_count");
     id_truncated = rb_intern("truncated");
     id_dim = rb_intern("dim");
     id_allow_unfrozen = rb_intern("allow_unfrozen");

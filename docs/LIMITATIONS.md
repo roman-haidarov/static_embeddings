@@ -13,9 +13,10 @@ the entry says whether that is a decision or just unfinished work.
 - **Only `.semb` files from this repository's converter.** Loading a
   HuggingFace directory at runtime is not supported and will not be. The
   converter is the only thing that reads third-party files, and it runs offline.
-- **Only the `BERT_WORDPIECE_V1` tokenizer profile.** SentencePiece, BPE, Unigram
-  and byte-level tokenizers are rejected at conversion time rather than
-  approximated.
+- **Only the pinned `BERT_WORDPIECE_V1` tokenizer profile.** SentencePiece, BPE,
+  Unigram and byte-level tokenizers are rejected. AddedVocabulary support is
+  deliberately limited to the five standard BERT special tokens with
+  `special: true`, `normalized: false` and no strip/single-word behavior.
 - **No model training, distillation or fine-tuning.** Produce the model with
   upstream `model2vec`, then convert it.
 - **No transformer inference.** Static embeddings have no attention and no
@@ -38,6 +39,10 @@ the entry says whether that is a decision or just unfinished work.
 - **Big-endian hosts are refused at load.** The header is decoded
   little-endian explicitly, but the mmapped structures and the float matrix are
   read in native order.
+- **Do not truncate/overwrite a mapped `.semb` in place.** On POSIX, shrinking
+  the inode underneath an existing mmap can raise `SIGBUS` in a worker. Deploy a
+  new file and atomically rename it over the path (`write .tmp` → `fsync` →
+  `rename`); existing workers keep their old inode mapping safely.
 
 ## Search
 
@@ -76,9 +81,10 @@ the entry says whether that is a decision or just unfinished work.
 - **`load` does not check the SHA-256.** Structural validation always runs, but
   a bit flip inside the matrix is only caught by `verify: true` or
   `StaticEmbeddings.verify`.
-- **Parity is per model and per runtime version.** A converted model is not
-  trusted until it has a record in `docs/MODEL_AUDIT.md`, and that record
-  expires when the tokenizer changes.
+- **Parity is per model, runtime, pinned upstream versions and corpus.** A
+  recorded pass means those rows passed; it is not an exhaustive proof of
+  tokenizer equivalence. The independent upstream CI and the Ruby implementation
+  fuzz intentionally test different things.
 
 ## Known open questions
 

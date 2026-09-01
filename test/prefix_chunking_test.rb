@@ -8,7 +8,7 @@ class PrefixChunkingTest < Minitest::Test
   end
 
   def assert_prefix_path_matches(text, label)
-    expected = @model.embed_token_ids(@model.tokenize(text))
+    expected = @model.embed_token_ids(@model.tokenize(text, max_tokens: false))
     assert_equal expected, @model.embed(text), "prefix path diverged for #{label}"
   end
 
@@ -100,7 +100,7 @@ class PrefixChunkingTest < Minitest::Test
       text = ("zz#{sep}" * 4000)
       next if text.bytesize < 10_000
 
-      expected = @model.embed_token_ids(@model.tokenize(text))
+      expected = @model.embed_token_ids(@model.tokenize(text, max_tokens: false))
       mismatches << format("0x%02x %s", code, sep.inspect) if @model.embed(text) != expected
     end
 
@@ -111,7 +111,7 @@ class PrefixChunkingTest < Minitest::Test
   def test_small_max_tokens_still_matches
     text = ("postgres pipeline mode in ruby static embeddings " * 5000)
     [1, 7, 64].each do |cap|
-      expected = @model.embed_token_ids(@model.tokenize(text, max_tokens: cap), max_tokens: cap)
+      expected = @model.embed_token_ids(@model.tokenize(text, max_tokens: false), max_tokens: cap)
       assert_equal expected, @model.embed(text, max_tokens: cap), "max_tokens=#{cap} diverged"
     end
   end
@@ -122,17 +122,22 @@ class PrefixChunkingTest < Minitest::Test
     5.times { assert_equal first, @model.embed(text) }
   end
 
-  def test_cjk_document_uses_the_prefix_path
+  def test_cjk_document_remains_exact_when_unk_filtering_requires_a_full_scan
     text = "中文测试文本内容" * 40_000
     assert_operator text.bytesize, :>, LARGE_BYTES
     assert_prefix_path_matches(text, "cjk without any ascii byte")
-    assert_prefix_cost_is_flat(text)
   end
 
-  def test_nbsp_separated_document_uses_the_prefix_path
+  def test_nbsp_separated_document_remains_exact_when_unk_filtering_requires_a_full_scan
     text = "слово\u00a0" * 40_000
     assert_operator text.bytesize, :>, LARGE_BYTES
     assert_prefix_path_matches(text, "cyrillic separated by U+00A0")
+  end
+
+  def test_in_vocab_document_keeps_prefix_cost_bounded
+    text = "postgres pipeline mode in ruby static embeddings vector search " * 20_000
+    assert_operator text.bytesize, :>, LARGE_BYTES
+    assert_prefix_path_matches(text, "in-vocabulary ascii prose")
     assert_prefix_cost_is_flat(text)
   end
 

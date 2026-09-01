@@ -11,7 +11,24 @@ module StaticEmbeddings
     end
 
     def model_path(model_id, env = ENV)
-      File.join(cache_dir(env), "models", "#{model_id}.semb")
+      id = model_id.to_s
+      raise ArgumentError, "model_id must not be empty" if id.empty?
+      raise ArgumentError, "model_id contains a NUL byte" if id.include?("\0")
+
+      normalized = id.tr("\\", "/")
+      parts = normalized.split("/", -1)
+      if normalized.start_with?("/") ||
+         parts.any? { |part| part.empty? || part == "." || part == ".." || part.include?(":") }
+        raise ArgumentError, "model_id must be a relative slash-separated identifier"
+      end
+
+      base = File.expand_path(File.join(cache_dir(env), "models"))
+      path = File.expand_path(File.join(base, "#{normalized}.semb"))
+      prefix = base.end_with?(File::SEPARATOR) ? base : "#{base}#{File::SEPARATOR}"
+      unless path.start_with?(prefix)
+        raise ArgumentError, "model_id escapes the model cache"
+      end
+      path
     end
 
     def builtin_path(name)

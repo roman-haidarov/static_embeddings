@@ -1,14 +1,18 @@
+require "json"
+require "static_embeddings/converter"
+require "static_embeddings/safetensors"
+
 module StaticEmbeddings
   class Reference
     CJK_RANGES = [
       0x4E00..0x9FFF, 0x3400..0x4DBF, 0x20000..0x2A6DF, 0x2A700..0x2B73F,
-      0x2B740..0x2B81F, 0x2B820..0x2CEAF, 0xF900..0xFAFF, 0x2F800..0x2FA1F
+      0x2B740..0x2B81F, 0x2B920..0x2CEAF, 0xF900..0xFAFF, 0x2F800..0x2FA1F
     ].freeze
 
     ASCII_PUNCT = [33..47, 58..64, 91..96, 123..126].freeze
     ASCII_SPACES = [" ", "\t", "\n", "\r"].freeze
     RE_PUNCT = /\A\p{P}\z/
-    RE_CONTROL = /\A(?:\p{Cc}|\p{Cf}|\p{Co}|\p{Cs})\z/
+    RE_CONTROL = /\A(?:\p{Cc}|\p{Cf}|\p{Co})\z/
     RE_MN = /\A\p{Mn}\z/
     RE_WHITESPACE = /\A(?:\p{Zs}|[\u0085\u2028\u2029])\z/
 
@@ -29,7 +33,7 @@ module StaticEmbeddings
       tokens = tokens_from(tokenizer)
       tensor = Safetensors.read(File.join(dir, "model.safetensors"))[:tensors].values.first
       rows, dim = tensor[:shape]
-      floats = tensor[:bytes].unpack("e*")
+      floats = Safetensors.f32_bytes(tensor).unpack("e*")
       normalizer = tokenizer["normalizer"] || {}
 
       new(tokens: tokens,
@@ -53,8 +57,19 @@ module StaticEmbeddings
         max_input_chars_per_word: tokenizer.dig("model", "max_input_chars_per_word") || 100,
         unk_token: tokenizer.dig("model", "unk_token") || "[UNK]",
         normalize: config.key?("normalize") ? config["normalize"] : true,
-        max_tokens: max_tokens
+        max_tokens: max_tokens,
+        added_tokens: supported_added_tokens(tokenizer)
       }
+    end
+
+    def self.supported_added_tokens(tokenizer)
+      allowed = Converter::STANDARD_SPECIAL_TOKENS
+      (tokenizer["added_tokens"] || []).each_with_object({}) do |token, out|
+        content = token["content"]
+        next unless token["special"] && allowed.key?(content) && token["normalized"] == false
+
+        out[content] = Integer(token.fetch("id"))
+      end
     end
 
     def normalize_text(text)
@@ -71,13 +86,13 @@ module StaticEmbeddings
     end
 
     def tokenize(text, max_tokens: @meta[:max_tokens])
-      ids = []
-      pre_tokenize(normalize_text(text)).each { |word| ids.concat(wordpiece(word)) }
+      ids = tokenize_with_added_tokens(text)
       max_tokens && max_tokens.positive? && ids.length > max_tokens ? ids.first(max_tokens) : ids
     end
 
     def embed(text, max_tokens: @meta[:max_tokens])
-      used = tokenize(text, max_tokens: max_tokens).reject { |id| id == unk_id }
+      used = tokenize(text, max_tokens: false).reject { |id| id == unk_id }
+      used = used.first(max_tokens) if max_tokens && max_tokens.positive? && used.length > max_tokens
       return Array.new(@dim, 0.0) if used.empty?
 
       vector = pooled(used)
@@ -85,6 +100,38 @@ module StaticEmbeddings
     end
 
     private
+
+    def tokenize_with_added_tokens(text)
+      added = @meta[:added_tokens]
+      return tokenize_plain(text) if added.empty?
+
+      ids = []
+      cursor = 0
+      binary = text.b
+      while cursor < text.bytesize
+        match = added.keys.filter_map do |literal|
+          index = binary.index(literal.b, cursor)
+          index && [index, -literal.bytesize, literal]
+        end.min
+
+        unless match
+          ids.concat(tokenize_plain(text.byteslice(cursor, text.bytesize - cursor)))
+          break
+        end
+
+        index, _, literal = match
+        ids.concat(tokenize_plain(text.byteslice(cursor, index - cursor))) if index > cursor
+        ids << added.fetch(literal)
+        cursor = index + literal.bytesize
+      end
+      ids
+    end
+
+    def tokenize_plain(text)
+      return [] if text.nil? || text.empty?
+
+      pre_tokenize(normalize_text(text)).flat_map { |word| wordpiece(word) }
+    end
 
     def clean_chars(chars)
       chars.filter_map do |ch|

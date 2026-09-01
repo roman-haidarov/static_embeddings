@@ -3,7 +3,7 @@ require "digest"
 module StaticEmbeddings
   module Format
     MAGIC = "SEMBv1\0\0"
-    VERSION = 2
+    VERSION = 3
     HEADER_SIZE = 320
     ALIGNMENT = 64
 
@@ -12,7 +12,7 @@ module StaticEmbeddings
     POOLING_MEAN = 1
     NORMALIZATION_NONE = 0
     NORMALIZATION_L2 = 1
-    TRUNCATE_IDS_BEFORE_POOLING = 1
+    TRUNCATE_USABLE_IDS_BEFORE_POOLING = 2
     UNK_INCLUDE = 0
     UNK_DROP = 1
     EMPTY_ZERO_VECTOR = 0
@@ -26,6 +26,14 @@ module StaticEmbeddings
     CHECKSUM_OFFSET = 240
     CHECKSUM_SIZE = 32
     MAX_PROBE_OFFSET = 304
+    ADDED_TOKEN_MASK_OFFSET = 308
+
+    ADDED_PAD  = 1 << 0
+    ADDED_UNK  = 1 << 1
+    ADDED_CLS  = 1 << 2
+    ADDED_SEP  = 1 << 3
+    ADDED_MASK = 1 << 4
+    ADDED_TOKEN_MASK_ALL = ADDED_PAD | ADDED_UNK | ADDED_CLS | ADDED_SEP | ADDED_MASK
 
     SECTION_FIELDS = {
       vocab_strings: 128,
@@ -44,7 +52,7 @@ module StaticEmbeddings
       28 => TOKENIZER_BERT_WORDPIECE_V1,
       32 => DTYPE_F32,
       36 => POOLING_MEAN,
-      48 => TRUNCATE_IDS_BEFORE_POOLING,
+      48 => TRUNCATE_USABLE_IDS_BEFORE_POOLING,
       108 => HASH_SEED
     }.freeze
 
@@ -102,7 +110,7 @@ module StaticEmbeddings
     def write(path:, meta:, tokens:, matrix:, norm_tables:, provenance:)
       hash_size, strings, hash_blob, max_probe = build_hash_table(tokens)
       root_trie, continuation_trie = build_wordpiece_tries(tokens, meta.fetch(:subword_prefix))
-      sections, body = build_body(
+      payloads = {
         vocab_strings: strings,
         vocab_hash: hash_blob,
         embeddings: matrix,
@@ -110,15 +118,48 @@ module StaticEmbeddings
         provenance: provenance,
         root_trie: root_trie,
         continuation_trie: continuation_trie
-      )
-
+      }
+      sections, file_size = layout_sections(payloads)
       header = build_header(meta, tokens.length, hash_size, max_probe, sections)
-      file = header << body
-      digest = Digest::SHA256.digest(file)
-      file[CHECKSUM_OFFSET, CHECKSUM_SIZE] = digest
 
-      File.binwrite(path, file)
-      { bytes: file.bytesize, sha256: digest.unpack1("H*"), hash_table_size: hash_size }
+      digest = Digest::SHA256.new
+      File.open(path, "wb") do |io|
+        io.write(header)
+        digest << header
+        offset = HEADER_SIZE
+
+        payloads.each do |name, payload|
+          target = sections.fetch(name).first
+          padding = target - offset
+          if padding.positive?
+            zeros = "\0".b * padding
+            io.write(zeros)
+            digest << zeros
+          end
+          write_payload(io, digest, payload)
+          offset = target + payload.bytesize
+        end
+      end
+
+      checksum = digest.digest
+      File.open(path, "r+b") do |io|
+        io.seek(CHECKSUM_OFFSET, IO::SEEK_SET)
+        io.write(checksum)
+      end
+
+      { bytes: file_size, sha256: checksum.unpack1("H*"), hash_table_size: hash_size }
+    end
+
+    def write_payload(io, digest, payload)
+      if payload.respond_to?(:each_chunk)
+        payload.each_chunk do |chunk|
+          io.write(chunk)
+          digest << chunk
+        end
+      else
+        io.write(payload)
+        digest << payload
+      end
     end
 
     def verify(path)
@@ -240,20 +281,16 @@ module StaticEmbeddings
       end
     end
 
-    def build_body(payloads)
-      body = binary_string
+    def layout_sections(payloads)
+      offset = HEADER_SIZE
       sections = {}
       payloads.each do |name, payload|
-        align_body!(body)
-        sections[name] = [HEADER_SIZE + body.bytesize, payload.bytesize]
-        body << payload
+        padding = (ALIGNMENT - (offset % ALIGNMENT)) % ALIGNMENT
+        offset += padding
+        sections[name] = [offset, payload.bytesize]
+        offset += payload.bytesize
       end
-      [sections, body]
-    end
-
-    def align_body!(body)
-      padding = (ALIGNMENT - ((HEADER_SIZE + body.bytesize) % ALIGNMENT)) % ALIGNMENT
-      body << "\0".b * padding if padding.positive?
+      [sections, offset]
     end
 
     def build_header(meta, vocab_size, hash_size, max_probe, sections)
@@ -268,6 +305,7 @@ module StaticEmbeddings
       put_u32(header, 104, hash_size)
       put_u32(header, MAX_TOKEN_CHARS_OFFSET, meta.fetch(:max_token_chars))
       put_u32(header, MAX_PROBE_OFFSET, max_probe)
+      put_u32(header, ADDED_TOKEN_MASK_OFFSET, meta.fetch(:added_token_mask, 0))
       put_prefix(header, meta.fetch(:subword_prefix))
       SECTION_FIELDS.each { |name, field| put_section(header, field, sections.fetch(name)) }
 

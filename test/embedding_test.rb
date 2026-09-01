@@ -219,12 +219,40 @@ class EmbeddingTest < Minitest::Test
     refute results.any? { |(_, score)| score.nan? }, "a NaN row leaked into the top-k"
   end
 
+  def test_unk_is_filtered_before_the_usable_token_cap
+    known = @model.tokenize("hello", max_tokens: false).fetch(0)
+    unk = @model.unk_id
+    ids = [known, unk, known, unk, known, unk, known, unk, known]
+
+    expected = @model.embed_token_ids([known, known, known, known], max_tokens: false)
+    assert_equal expected, @model.embed_token_ids(ids, max_tokens: 4)
+
+    stats = @model.embed_token_ids_with_stats(ids, max_tokens: 4)
+    assert_equal 7, stats.fetch(:token_count)
+    assert_equal 3, stats.fetch(:unk_count)
+    assert_equal 4, stats.fetch(:pooled_count)
+    assert stats.fetch(:truncated)
+  end
+
+  def test_text_embedding_scans_past_unk_to_fill_the_usable_cap
+    text = "hello [UNK] hello [UNK] hello [UNK] hello [UNK] world"
+    raw = @model.tokenize(text, max_tokens: false)
+
+    assert_includes raw, @model.unk_id
+    assert_equal @model.embed_token_ids(raw, max_tokens: 4), @model.embed(text, max_tokens: 4)
+
+    stats = @model.embed_with_stats(text, max_tokens: 4)
+    assert_equal 4, stats.fetch(:pooled_count)
+    assert_operator stats.fetch(:token_count), :>, 4
+    assert stats.fetch(:truncated)
+  end
+
   def test_embed_token_ids_debug_path
     ids = @model.tokenize("hello world")
     assert_equal @model.embed("hello world"), @model.embed_token_ids(ids)
   end
 
-  def test_embed_token_ids_truncates_before_pooling
+  def test_embed_token_ids_caps_usable_ids_before_pooling
     ids = @model.tokenize("hello world ruby postgres vector")
     skip "fixture text is too short to truncate" if ids.length < 3
 
@@ -238,6 +266,7 @@ class EmbeddingTest < Minitest::Test
 
     stats = @model.embed_token_ids_with_stats(ids, max_tokens: 2)
     assert_equal 2, stats.fetch(:token_count)
+    assert_equal 2, stats.fetch(:pooled_count)
     assert stats.fetch(:truncated)
     assert_equal @model.dim * 4, stats.fetch(:vector).bytesize
 

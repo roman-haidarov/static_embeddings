@@ -8,7 +8,7 @@
 
 #define SE_MAGIC          "SEMBv1\0\0"
 #define SE_MAGIC_LEN      8
-#define SE_FORMAT_VERSION 2u
+#define SE_FORMAT_VERSION 3u
 #define SE_HEADER_SIZE    320u
 #define SE_ALIGNMENT      64u
 
@@ -18,13 +18,21 @@
 #define SE_NORMALIZATION_NONE          0u
 #define SE_NORMALIZATION_L2            1u
 
-#define SE_TRUNCATE_IDS_BEFORE_POOLING 1u
+#define SE_TRUNCATE_USABLE_IDS_BEFORE_POOLING 2u
 
 #define SE_UNK_INCLUDE 0u
 #define SE_UNK_DROP    1u
 
 #define SE_EMPTY_ZERO_VECTOR 0u
 #define SE_EMPTY_RAISE       1u
+
+#define SE_ADDED_PAD  (1u << 0)
+#define SE_ADDED_UNK  (1u << 1)
+#define SE_ADDED_CLS  (1u << 2)
+#define SE_ADDED_SEP  (1u << 3)
+#define SE_ADDED_MASK (1u << 4)
+#define SE_ADDED_TOKEN_MASK_ALL \
+    (SE_ADDED_PAD | SE_ADDED_UNK | SE_ADDED_CLS | SE_ADDED_SEP | SE_ADDED_MASK)
 
 #define SE_SLOT_EMPTY 0xFFFFFFFFu
 #define SE_SIZE_MAX   ((size_t)-1)
@@ -83,7 +91,8 @@ enum {
     SE_OFF_SEC_ROOT_TRIE = 208,
     SE_OFF_SEC_CONT_TRIE = 224,
     SE_OFF_CHECKSUM = 240,
-    SE_OFF_MAX_PROBE = 304
+    SE_OFF_MAX_PROBE = 304,
+    SE_OFF_ADDED_TOKEN_MASK = 308
 };
 
 typedef struct {
@@ -163,6 +172,7 @@ typedef struct {
     uint32_t max_input_chars_per_word;
     uint32_t max_token_chars;
     uint32_t max_probe;
+    uint32_t added_token_mask;
     uint32_t pad_id;
     uint32_t unk_id;
     uint32_t cls_id;
@@ -401,9 +411,11 @@ typedef struct {
     uint32_t truncated;
 } se_token_stats_t;
 
+typedef enum { SE_TOKEN_LIMIT_RAW = 0, SE_TOKEN_LIMIT_USABLE = 1 } se_token_limit_t;
+
 se_status_t se_tokenize(const se_model_t *model, se_scratch_t *scratch, const uint8_t *input,
-                        size_t input_len, uint32_t max_tokens, se_token_stats_t *stats,
-                        se_error_t *err, volatile sig_atomic_t *cancelled);
+                        size_t input_len, uint32_t max_tokens, se_token_limit_t limit_mode,
+                        se_token_stats_t *stats, se_error_t *err, volatile sig_atomic_t *cancelled);
 
 se_status_t se_embed_one(const se_model_t *model, se_scratch_t *scratch, const uint8_t *input,
                          size_t input_len, uint32_t max_tokens, float *out, se_token_stats_t *stats,

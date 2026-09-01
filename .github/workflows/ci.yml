@@ -185,6 +185,75 @@ jobs:
           WINEDEBUG: "-all"
         run: wine tmp/memory_smoke.exe tmp/test-tiny.semb
 
+  upstream_parity:
+    name: pinned upstream parity (434-case corpus)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+          bundler-cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: install pinned oracle dependencies
+        run: python -m pip install "model2vec==0.9.0" "tokenizers==0.23.1" "numpy==2.5.2"
+      - run: bundle exec rake compile
+      - name: build deterministic source fixture and .semb
+        run: |
+          ruby tools/make_fixture_model.rb test/fixtures/tiny-wordpiece
+          mkdir -p tmp
+          bundle exec ruby -Ilib -e 'require "static_embeddings"; StaticEmbeddings.convert("test/fixtures/tiny-wordpiece", output_path: "tmp/parity-tiny.semb", model_id: "fixture/tiny-wordpiece")'
+      - name: generate independent upstream oracle
+        run: python tools/model2vec_oracle.py test/fixtures/tiny-wordpiece --out tmp/model2vec_oracle.json
+      - name: compare native runtime with pinned upstream
+        run: bundle exec ruby -Ilib tools/check_model2vec_parity.rb --model tmp/parity-tiny.semb --oracle tmp/model2vec_oracle.json
+
+  potion_audit:
+    name: potion-retrieval-32M real-model audit
+    runs-on: ubuntu-latest
+    needs: upstream_parity
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+          bundler-cache: true
+      - uses: actions/setup-python@v5
+        with:
+          # numpy 2.5.2 (the version recorded in the 0.1.4 potion audit) requires >=3.12
+          python-version: "3.12"
+      - name: install pinned oracle dependencies
+        run: python -m pip install "model2vec==0.9.0" "tokenizers==0.23.1" "numpy==2.5.2" huggingface_hub
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface/hub
+          key: hf-potion-retrieval-32m-6fc8051fab2a1e0ee76689cf08c853792ac285e7
+      - run: bundle exec rake compile
+      - name: fetch pinned potion snapshot
+        id: snapshot
+        shell: bash
+        run: |
+          source_dir="$(python -c 'from huggingface_hub import snapshot_download; print(snapshot_download("minishlab/potion-retrieval-32M", revision="6fc8051fab2a1e0ee76689cf08c853792ac285e7"))')"
+          echo "source_dir=$source_dir" >> "$GITHUB_OUTPUT"
+      - name: convert pinned model to .semb v3
+        env:
+          SOURCE_DIR: ${{ steps.snapshot.outputs.source_dir }}
+        run: |
+          mkdir -p tmp
+          bundle exec ruby -Ilib -e 'require "static_embeddings"; StaticEmbeddings.convert(ENV.fetch("SOURCE_DIR"), output_path: "tmp/potion-retrieval-32m-v3.semb", model_id: "minishlab/potion-retrieval-32M")'
+      - name: generate real-model upstream oracle
+        env:
+          SOURCE_DIR: ${{ steps.snapshot.outputs.source_dir }}
+        run: python tools/model2vec_oracle.py "$SOURCE_DIR" --out tmp/potion_oracle.json
+      - name: compare v3 runtime with pinned potion oracle
+        run: bundle exec ruby -Ilib tools/check_model2vec_parity.rb --model tmp/potion-retrieval-32m-v3.semb --oracle tmp/potion_oracle.json
+      - name: print reproducible audit identifiers
+        run: |
+          sha256sum tmp/potion-retrieval-32m-v3.semb
+          ruby -Ilib -e 'require "static_embeddings"; m=StaticEmbeddings.load("tmp/potion-retrieval-32m-v3.semb"); puts "bytes=#{File.size(m.path)} dim=#{m.dim} vocab=#{m.vocab_size} format=3"'
+
   benchmark:
     runs-on: ubuntu-latest
     steps:

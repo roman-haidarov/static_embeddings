@@ -4,6 +4,7 @@ require "tmpdir"
 
 $LOAD_PATH.unshift(File.expand_path("../lib", __dir__))
 require "static_embeddings"
+require "static_embeddings/reference"
 
 require_relative "../tools/make_fixture_model"
 

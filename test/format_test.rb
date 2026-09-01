@@ -147,6 +147,29 @@ class FormatTest < Minitest::Test
     end
   end
 
+  def test_hash_table_load_factor_is_validated_on_load
+    Dir.mktmpdir do |dir|
+      path = File.join(dir, "dense_hash.semb")
+      data = File.binread(@path).dup
+      hash_size = read_u32(data, 104)
+      data[24, 4] = [hash_size].pack("V")
+      File.binwrite(path, data)
+      error = assert_raises(StaticEmbeddings::InvalidModelError) { StaticEmbeddings.load(path) }
+      assert_match(/load factor/, error.message)
+    end
+  end
+
+  def test_unknown_added_token_bits_are_rejected
+    Dir.mktmpdir do |dir|
+      path = File.join(dir, "bad_added_mask.semb")
+      data = File.binread(@path).dup
+      data[StaticEmbeddings::Format::ADDED_TOKEN_MASK_OFFSET, 4] = [1 << 31].pack("V")
+      File.binwrite(path, data)
+      error = assert_raises(StaticEmbeddings::InvalidModelError) { StaticEmbeddings.load(path) }
+      assert_match(/added-token mask/, error.message)
+    end
+  end
+
   def test_invalid_header_policy_is_rejected
     Dir.mktmpdir do |dir|
       path = File.join(dir, "bad_policy.semb")

@@ -86,7 +86,7 @@ class AsciiParityTest < Minitest::Test
       assert_equal @reference.tokenize(text).first(@model.max_tokens),
                    @model.tokenize(text),
                    "token ids differ with DEL at byte offset #{offset}"
-      assert_equal @model.embed_token_ids(@model.tokenize(text)), @model.embed(text),
+      assert_equal @model.embed_token_ids(@model.tokenize(text, max_tokens: false)), @model.embed(text),
                    "embed disagrees with its own tokenization at byte offset #{offset}"
     end
   end
@@ -96,7 +96,7 @@ class AsciiParityTest < Minitest::Test
     text = "#{filler * 70}\u007Ftail word#{filler * 70}"
 
     assert_equal @reference.tokenize(text).first(@model.max_tokens), @model.tokenize(text)
-    assert_equal @model.embed_token_ids(@model.tokenize(text)), @model.embed(text)
+    assert_equal @model.embed_token_ids(@model.tokenize(text, max_tokens: false)), @model.embed(text)
   end
 
   private

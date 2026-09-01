@@ -197,7 +197,8 @@ se_status_t se_embed_ids(const se_model_t *model, se_scratch_t *sc, const uint32
 se_status_t se_embed_one(const se_model_t *model, se_scratch_t *sc, const uint8_t *input,
                          size_t input_len, uint32_t max_tokens, float *out, se_token_stats_t *stats,
                          se_error_t *err, volatile sig_atomic_t *cancelled) {
-    se_status_t rc = se_tokenize(model, sc, input, input_len, max_tokens, stats, err, cancelled);
+    se_status_t rc = se_tokenize(model, sc, input, input_len, max_tokens, SE_TOKEN_LIMIT_USABLE,
+                                 stats, err, cancelled);
     if (rc != SE_OK)
         return rc;
     return embed_ids_core(model, sc, sc->ids, stats->token_count, out, err, cancelled);
