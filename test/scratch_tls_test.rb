@@ -42,6 +42,22 @@ class ScratchTlsTest < Minitest::Test
                     "large input pinned scratch: baseline=#{baseline} after=#{after}"
   end
 
+  def test_oov_truncation_reuses_ids_high_water_mark
+    skip "allocation stats build was not loaded" unless StaticEmbeddings.respond_to?(:__alloc_stats__)
+
+    text = (("hello [UNK] " * 700) + "world").freeze
+
+    # First call is allowed to grow the TLS ids buffer past the 512-id reserve.
+    @model.embed(text)
+    StaticEmbeddings.__alloc_stats_reset__
+
+    100.times { @model.embed(text) }
+    stats = StaticEmbeddings.__alloc_stats__.fetch(:scratch)
+
+    assert_equal 0, stats.fetch(:realloc_count),
+                 "steady-state OOV truncation kept reallocating scratch: #{stats.inspect}"
+  end
+
   def test_nested_calls_on_one_thread_still_work
     ids = @model.tokenize("hello world")
     blob = @model.embed("hello world")

@@ -102,7 +102,7 @@ int se_vocab_lookup_piece(const se_model_t *model, const uint8_t *prefix, size_t
     uint32_t pos = h & mask;
     uint32_t total_len = (uint32_t)(prefix_len + len);
 
-    for (uint32_t probe = 0; probe <= mask; probe++) {
+    for (uint32_t probe = 0; probe < model->meta.max_probe; probe++) {
         const se_vocab_slot_t *slot = &model->vocab_hash[pos];
         if (slot->token_id == SE_SLOT_EMPTY)
             return 0;
@@ -556,6 +556,31 @@ static se_status_t validate_vocab_hash(const se_model_t *model, struct section v
         se_error_set(err, SE_ERR_INVALID_FORMAT,
                      "[UNK] is not reachable through the vocabulary hash");
         rc = SE_ERR_INVALID_FORMAT;
+        goto done;
+    }
+
+    static const struct {
+        uint32_t bit;
+        const char *text;
+        uint32_t len;
+    } added[] = {
+        {SE_ADDED_PAD, "[PAD]", 5u}, {SE_ADDED_UNK, "[UNK]", 5u},   {SE_ADDED_CLS, "[CLS]", 5u},
+        {SE_ADDED_SEP, "[SEP]", 5u}, {SE_ADDED_MASK, "[MASK]", 6u},
+    };
+    const uint32_t ids[] = {m->pad_id, m->unk_id, m->cls_id, m->sep_id, m->mask_id};
+
+    for (size_t i = 0; i < SE_ARRAY_LEN(added); i++) {
+        if ((m->added_token_mask & added[i].bit) == 0)
+            continue;
+        uint32_t got = 0;
+        if (ids[i] >= m->vocab_size ||
+            !se_vocab_lookup(model, (const uint8_t *)added[i].text, added[i].len, &got) ||
+            got != ids[i]) {
+            se_error_set(err, SE_ERR_INVALID_FORMAT,
+                         "added token %s is not reachable at its recorded id", added[i].text);
+            rc = SE_ERR_INVALID_FORMAT;
+            goto done;
+        }
     }
 
 done:
@@ -646,6 +671,7 @@ static se_status_t validate(se_model_t *model, se_error_t *err) {
     m->subword_prefix_len = read_u32(base, SE_OFF_SUBWORD_PREFIX_LEN);
     m->max_token_chars = read_u32(base, SE_OFF_MAX_TOKEN_CHARS);
     m->max_probe = read_u32(base, SE_OFF_MAX_PROBE);
+    m->added_token_mask = read_u32(base, SE_OFF_ADDED_TOKEN_MASK);
     memcpy(m->subword_prefix, base + SE_OFF_SUBWORD_PREFIX, 8);
 
     if (m->tokenizer_type != SE_TOKENIZER_BERT_WORDPIECE_V1) {
@@ -669,7 +695,7 @@ static se_status_t validate(se_model_t *model, se_error_t *err) {
                      m->normalization_type);
         return SE_ERR_INVALID_FORMAT;
     }
-    if (m->truncation_policy != SE_TRUNCATE_IDS_BEFORE_POOLING) {
+    if (m->truncation_policy != SE_TRUNCATE_USABLE_IDS_BEFORE_POOLING) {
         se_error_set(err, SE_ERR_INVALID_FORMAT, "truncation policy %u is not supported",
                      m->truncation_policy);
         return SE_ERR_INVALID_FORMAT;
@@ -680,6 +706,11 @@ static se_status_t validate(se_model_t *model, se_error_t *err) {
     }
     if (m->unk_policy != SE_UNK_INCLUDE && m->unk_policy != SE_UNK_DROP) {
         se_error_set(err, SE_ERR_INVALID_FORMAT, "unknown UNK policy %u", m->unk_policy);
+        return SE_ERR_INVALID_FORMAT;
+    }
+    if ((m->added_token_mask & ~SE_ADDED_TOKEN_MASK_ALL) != 0) {
+        se_error_set(err, SE_ERR_INVALID_FORMAT, "unknown added-token mask bits 0x%x",
+                     m->added_token_mask & ~SE_ADDED_TOKEN_MASK_ALL);
         return SE_ERR_INVALID_FORMAT;
     }
     if (m->empty_policy != SE_EMPTY_ZERO_VECTOR && m->empty_policy != SE_EMPTY_RAISE) {
@@ -704,8 +735,14 @@ static se_status_t validate(se_model_t *model, se_error_t *err) {
                      m->hash_table_size);
         return SE_ERR_INVALID_FORMAT;
     }
-    if (m->hash_table_size < m->vocab_size) {
-        se_error_set(err, SE_ERR_INVALID_FORMAT, "hash table smaller than vocabulary");
+    if (m->hash_table_size <= m->vocab_size ||
+        (uint64_t)m->vocab_size * 100u > (uint64_t)m->hash_table_size * 70u) {
+        se_error_set(err, SE_ERR_INVALID_FORMAT,
+                     "hash table load factor exceeds the supported 0.70 maximum");
+        return SE_ERR_INVALID_FORMAT;
+    }
+    if (m->max_probe == 0 || m->max_probe > m->hash_table_size) {
+        se_error_set(err, SE_ERR_INVALID_FORMAT, "invalid recorded max probe %u", m->max_probe);
         return SE_ERR_INVALID_FORMAT;
     }
     if (m->subword_prefix_len > 8) {

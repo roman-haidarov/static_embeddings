@@ -65,6 +65,7 @@ module StaticEmbeddings
     end
 
     def convert(argv)
+      require "static_embeddings/converter"
       options = parse_convert_options(argv)
       source = required_arg(argv, "usage: static_embeddings convert SOURCE_DIR [--out PATH]")
       model_id = options[:id] || File.basename(File.expand_path(source))

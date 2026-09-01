@@ -27,7 +27,6 @@ class TokenizerTest < Minitest::Test
   end
 
   def test_lowercasing_is_not_case_folding
-
     assert_equal @model.tokenize("ß"), @model.tokenize("ß".downcase)
     refute_equal @model.tokenize("ss"), @model.tokenize("ß")
   end
@@ -39,8 +38,33 @@ class TokenizerTest < Minitest::Test
     assert_operator @model.tokenize(text, max_tokens: false).length, :>, 700
   end
 
-  def test_unknown_words_become_single_unk
+  def test_standard_added_tokens_are_extracted_before_normalization
+    mask_id = @model.tokenize("[MASK]", max_tokens: false)
+    assert_equal [4], mask_id
 
+    hello = @model.tokenize("hello", max_tokens: false)
+    world = @model.tokenize("world", max_tokens: false)
+    assert_equal hello + [4] + world, @model.tokenize("hello[MASK]world", max_tokens: false)
+    refute_equal [4], @model.tokenize("[mask]", max_tokens: false)
+  end
+
+  def test_unassigned_codepoints_follow_pinned_rust_is_other_behavior
+    # tokenizers 0.23.1 delegates to unicode_categories 0.1.1. Its is_other()
+    # implementation does not include Cn despite the bert.rs comment saying it does.
+    assert_equal [@model.unk_id], @model.tokenize("hel\u0378lo", max_tokens: false)
+  end
+
+  def test_cjk_boundary_matches_tokenizers_0_23_1
+    before_rust_range = [0x2B820].pack("U")
+    first_rust_range = [0x2B920].pack("U")
+
+    assert_equal [@model.unk_id], @model.tokenize("hello#{before_rust_range}world", max_tokens: false)
+    assert_equal @model.tokenize("hello", max_tokens: false) + [@model.unk_id] +
+                 @model.tokenize("world", max_tokens: false),
+                 @model.tokenize("hello#{first_rust_range}world", max_tokens: false)
+  end
+
+  def test_unknown_words_become_single_unk
     ids = @model.tokenize("\u03be\u03c8\u03c9")
     assert_equal [@model.unk_id], ids
   end
@@ -49,6 +73,7 @@ class TokenizerTest < Minitest::Test
     stats = @model.embed_with_stats("\u03be\u03c8\u03c9 \u03b1\u03b2\u03b3 hello")
     assert_equal 3, stats[:token_count]
     assert_equal 2, stats[:unk_count]
+    assert_equal 1, stats[:pooled_count]
     assert_in_delta 2.0 / 3.0, stats[:unk_count].to_f / stats[:token_count], 1e-9
     refute stats[:truncated]
   end

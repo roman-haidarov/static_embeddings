@@ -33,7 +33,7 @@ in `se_internal.h`: the header fields are decoded little-endian explicitly, but
 the mmapped structures and the float matrix are read in native order, so a
 big-endian host is refused at load rather than silently misread.
 
-## `.semb` v2
+## `.semb` v3
 
 Little-endian throughout. 320-byte header, then sections aligned to 64 bytes.
 
@@ -69,6 +69,7 @@ Little-endian throughout. 320-byte header, then sections aligned to 64 bytes.
 | 208–239 | 32 | two (offset, size) u64 pairs: `root_trie`, `continuation_trie` |
 | 240 | 32 | sha256 of the file with these 32 bytes zeroed |
 | 304 | 4 | max_probe observed in the vocabulary hash |
+| 308 | 4 | supported added-token bit mask |
 
 Sections, in fixed order: `vocab_strings`, `vocab_hash`, `embeddings`,
 `norm_tables`, `provenance`, `root_trie`, `continuation_trie`.
@@ -79,11 +80,12 @@ already has a slot for I8; there is no dead I8 path in C.
 ### Why the semantics live in the header
 
 `max_tokens_default`, `unk_policy`, `empty_policy` and the normalizer flags
-are properties of the *model*, not options the caller guesses. The reference
-implementation truncates at 512 tokens; a model card's `model_max_length` of
-1,000,000 is a different number entirely, and confusing them silently changes
-every vector for long chunks. Anything that can silently change output is a
-recorded field.
+are properties of the *model*, not options the caller guesses. The embedding contract caps the first 512 usable token ids by default;
+a model card's `model_max_length` of 1,000,000 is a different number entirely, and
+confusing them silently changes every vector for long chunks. Model2Vec 0.9.0
+also applies a character pre-cut before tokenization; this runtime intentionally
+does not copy that heuristic. Anything that can silently change output is a
+recorded field or an explicitly documented compatibility deviation.
 
 ## Vocabulary lookup and WordPiece trie
 
@@ -93,7 +95,7 @@ load factor ≤ 0.70, linear probing, FNV-1a with a fixed seed. The hash table i
 kept for validation, direct lookup and debugging.
 
 The hot WordPiece path no longer performs repeated hash lookups for every
-`end--` candidate. Format v2 also stores two converter-built, mmap-readable
+`end--` candidate. The format also stores two converter-built, mmap-readable
 tries inspired by double-array trie libraries such as libdatrie:
 
 - `root_trie` for tokens that can start a word;
@@ -135,8 +137,8 @@ Rejected alternatives:
 
 ## Unicode without a Unicode library
 
-`BertNormalizer` needs NFD, simple lowercase, and the Mn / P / C / Zs
-categories. Rather than vendoring utf8proc, the converter generates exactly
+`BertNormalizer` needs NFD, simple lowercase, and selected Unicode
+categories (Mn, punctuation, control/format/private-use, and whitespace). Rather than vendoring utf8proc, the converter generates exactly
 those tables from the Ruby VM's own Unicode data and writes them into the
 model file; the runtime binary-searches them.
 
@@ -146,15 +148,20 @@ maps `ß` to `ss`; `str::to_lowercase`, which HF uses, does not. A gem that
 picked the wrong one would produce plausible, slightly wrong vectors forever.
 
 The Ruby build that generated the tables is stamped into provenance, so a
-model file and its normalizer can never drift apart unnoticed.
+model file and its embedded normalizer tables can never drift apart unnoticed.
+That stamp is not, by itself, proof of Hugging Face parity: 0.1.5 therefore
+checks a systematic boundary corpus against pinned `tokenizers 0.23.1` in CI.
+One subtle example is `Cn`: `bert.rs` says `is_other()` includes unassigned
+codepoints, while the `unicode_categories 0.1.1` implementation actually tests
+Cc/Cf/Co. The runtime follows the executable upstream behavior, not the comment.
 
 ## The embedding kernel
 
 ```
-tokenize -> ids
-truncate to max_tokens          (before pooling — the reference contract)
+tokenize -> raw ids (including [UNK])
 drop [UNK] if unk_policy = DROP
-acc[j] += row[j] for each id, in token order
+truncate usable ids to max_tokens
+acc[j] += row[j] for each usable id, in token order
 divide by the number of pooled rows
 L2 normalize if the model says so
 ```
@@ -209,10 +216,11 @@ therefore serialised the process on work that the tokenizer would discard after
 
 `embed` and `embed_batch` instead copy a leading slice. The budget starts at
 `max_tokens * 16` bytes clamped to `[4096, 65536]`, and the slice is cut at a
-position where the tokenizer would have started a fresh word. A result is
-accepted only when that slice actually reached `max_tokens`; otherwise the
-budget doubles and the text is tokenized again. Growth is geometric, so the
-pathological case costs about twice the single-pass work.
+position where the tokenizer would have started a fresh word. A result is accepted only when that slice actually reached `max_tokens`
+usable ids; `[UNK]` does not consume the embedding budget. Otherwise the budget
+doubles and the text is tokenized again. Growth is geometric. OOV-heavy input
+may therefore reach the full document: deciding that fewer than `max_tokens`
+usable ids exist requires reading it.
 
 Three properties make this exact rather than approximate:
 
@@ -241,10 +249,11 @@ the predicate is Unicode-aware. Text with genuinely no legal cut inside the scan
 window - one enormous word, a run of combining marks - still falls back to a
 full copy, because there is nothing else that would be correct.
 
-`test/prefix_chunking_test.rb` sweeps every printable ASCII separator, checks
-CJK, NBSP and Unicode-punctuation documents against
-`embed_token_ids(tokenize(text))`, and asserts that quadrupling the input does
-not triple the cost.
+`test/prefix_chunking_test.rb` sweeps every printable ASCII separator and
+checks CJK, NBSP and Unicode-punctuation documents against unbounded raw
+tokenization followed by `embed_token_ids`. It asserts bounded prefix cost for
+in-vocabulary text; deliberately OOV-heavy input is checked for correctness, not
+flat cost.
 
 With `max_tokens: false` there is nothing to truncate and the whole input is
 copied.
@@ -299,10 +308,13 @@ interrupts a GVL-free region.
 No global mutable state exists in C. The model is immutable after load.
 Scratch buffers are reused per OS thread via `pthread_key` / `FlsAlloc`, and
 the destructor frees them when the thread exits — including the short-lived
-threads the fiber scheduler path creates per large call. On release the slot
-is trimmed back to the reserve sizes, so a single unlimited-`max_tokens`
-document does not pin its working set until the thread dies. A nested call on
-the same thread allocates a one-off heap scratch that is freed on release.
+threads the fiber scheduler path creates per large call. On release the
+codepoint/byte buffers are trimmed back to their reserve sizes. The token-id
+buffer keeps its observed high-water mark up to 8192 ids so repeated OOV-heavy
+usable-token truncation does not grow and shrink it on every call; larger
+capacities are trimmed back to that bound so one unlimited-`max_tokens`
+document cannot pin an arbitrary per-thread working set. A nested call on the
+same thread allocates a one-off heap scratch that is freed on release.
 
 ## Where this fits in a RAG pipeline
 
@@ -321,12 +333,11 @@ chunks -> .semb vectors --/
 
 ## Open questions before v1.0
 
-1. **Which potion models actually match `BERT_WORDPIECE_V1`.** The 32M family
-   has a larger vocabulary than the bge-base tokenizer it was distilled from,
-   which means tokens were added somewhere. If they live in `added_tokens`
-   rather than `model.vocab`, HF matches them with a separate trie pass over
-   raw text that this runtime does not implement. The converter refuses such
-   models today; whether it has to is an audit question.
+1. **Which potion models actually match `BERT_WORDPIECE_V1`.** The runtime now
+   implements the exact `normalized: false` extraction semantics needed by the
+   five standard BERT added tokens, but still rejects arbitrary AddedVocabulary,
+   BPE and Unigram profiles. Each source model still needs an audit before it is
+   treated as compatible.
 2. **Russian.** Distilling a multilingual teacher into a WordPiece vocabulary
    we control keeps the pure-C path, but skips the Tokenlearn pre-training
    that gives the published potion models their quality. That gap has to be

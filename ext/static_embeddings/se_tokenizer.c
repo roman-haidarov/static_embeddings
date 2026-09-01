@@ -87,16 +87,17 @@ static int push_id(se_scratch_t *sc, size_t *n_ids, uint32_t id) {
     return 1;
 }
 
-#define SE_SCRATCH_CPS_KEEP   256
-#define SE_SCRATCH_IDS_KEEP   512
-#define SE_SCRATCH_BYTES_KEEP 1024
+#define SE_SCRATCH_CPS_KEEP       256
+#define SE_SCRATCH_IDS_RESERVE    512
+#define SE_SCRATCH_IDS_RETAIN_MAX 8192
+#define SE_SCRATCH_BYTES_KEEP     1024
 
 int se_scratch_reserve(se_scratch_t *s, uint32_t dim) {
     if (!grow_u32(&s->cps, &s->cps_cap, SE_SCRATCH_CPS_KEEP))
         return 0;
     if (!grow_u32(&s->cps2, &s->cps2_cap, SE_SCRATCH_CPS_KEEP))
         return 0;
-    if (!grow_u32(&s->ids, &s->ids_cap, SE_SCRATCH_IDS_KEEP))
+    if (!grow_u32(&s->ids, &s->ids_cap, SE_SCRATCH_IDS_RESERVE))
         return 0;
     if (!grow_bytes(&s->bytes, &s->bytes_cap, SE_SCRATCH_BYTES_KEEP))
         return 0;
@@ -149,7 +150,8 @@ static int shrink_bytes(uint8_t **buf, size_t *cap, size_t keep) {
 static void se_scratch_trim(se_scratch_t *s) {
     (void)shrink_u32(&s->cps, &s->cps_cap, SE_SCRATCH_CPS_KEEP);
     (void)shrink_u32(&s->cps2, &s->cps2_cap, SE_SCRATCH_CPS_KEEP);
-    (void)shrink_u32(&s->ids, &s->ids_cap, SE_SCRATCH_IDS_KEEP);
+    if (s->ids_cap > SE_SCRATCH_IDS_RETAIN_MAX)
+        (void)shrink_u32(&s->ids, &s->ids_cap, SE_SCRATCH_IDS_RETAIN_MAX);
     (void)shrink_bytes(&s->bytes, &s->bytes_cap, SE_SCRATCH_BYTES_KEEP);
 }
 
@@ -393,6 +395,37 @@ static int cp_is_cjk_segment(const se_model_t *m, uint32_t cp) {
     return m->meta.handle_chinese_chars && cp >= 0x3400 && se_is_cjk(cp);
 }
 
+typedef struct {
+    const char *text;
+    uint32_t len;
+    uint32_t bit;
+} se_added_token_spec_t;
+
+static const se_added_token_spec_t SE_ADDED_TOKENS[] = {
+    {"[MASK]", 6u, SE_ADDED_MASK}, {"[PAD]", 5u, SE_ADDED_PAD}, {"[UNK]", 5u, SE_ADDED_UNK},
+    {"[CLS]", 5u, SE_ADDED_CLS},   {"[SEP]", 5u, SE_ADDED_SEP},
+};
+
+static int boundary_splits_added_token(const se_model_t *model, const uint8_t *input,
+                                       size_t input_len, size_t boundary) {
+    if (model->meta.added_token_mask == 0 || boundary == 0 || boundary >= input_len)
+        return 0;
+
+    for (size_t k = 0; k < SE_ARRAY_LEN(SE_ADDED_TOKENS); k++) {
+        const se_added_token_spec_t *token = &SE_ADDED_TOKENS[k];
+        if ((model->meta.added_token_mask & token->bit) == 0)
+            continue;
+        for (size_t back = 1; back < token->len && back <= boundary; back++) {
+            size_t start = boundary - back;
+            if (start + token->len > input_len || input[start] != '[')
+                continue;
+            if (memcmp(input + start, token->text, token->len) == 0)
+                return 1;
+        }
+    }
+    return 0;
+}
+
 size_t se_prefix_boundary_len(const se_model_t *model, const uint8_t *input, size_t input_len,
                               size_t target, size_t backscan) {
     if (target >= input_len)
@@ -420,14 +453,15 @@ size_t se_prefix_boundary_len(const se_model_t *model, const uint8_t *input, siz
             continue;
 
         if (cp_is_cjk_segment(model, cp)) {
-            if (after <= target)
+            if (after <= target && !boundary_splits_added_token(model, input, input_len, after))
                 return after;
-            if (pos > 0)
+            if (pos > 0 && !boundary_splits_added_token(model, input, input_len, pos))
                 return pos;
-            return 0;
+            continue;
         }
 
-        if ((is_whitespace(model, cp) || is_punct(model, cp)) && after <= target)
+        if ((is_whitespace(model, cp) || is_punct(model, cp)) && after <= target &&
+            !boundary_splits_added_token(model, input, input_len, after))
             return after;
     }
 
@@ -454,6 +488,7 @@ typedef struct {
     const se_model_t *model;
     se_scratch_t *scratch;
     uint32_t max_tokens;
+    se_token_limit_t limit_mode;
     size_t n_ids;
     size_t n_unk;
     size_t segment_len;
@@ -481,17 +516,44 @@ static int append_segment_cp(token_state_t *st, uint32_t cp) {
     return 1;
 }
 
+static size_t limited_token_count(const token_state_t *st) {
+    if (st->limit_mode == SE_TOKEN_LIMIT_USABLE && st->model->meta.unk_policy == SE_UNK_DROP)
+        return st->n_ids - st->n_unk;
+    return st->n_ids;
+}
+
 static int cap_after_append(token_state_t *st) {
-    if (st->max_tokens == 0 || st->n_ids <= (size_t)st->max_tokens)
+    if (st->max_tokens == 0 || limited_token_count(st) <= (size_t)st->max_tokens)
         return 0;
 
-    size_t dropped_unk = 0;
-    for (size_t k = st->max_tokens; k < st->n_ids; k++) {
-        if (st->scratch->ids[k] == st->model->meta.unk_id)
-            dropped_unk++;
+    if (st->limit_mode == SE_TOKEN_LIMIT_RAW || st->model->meta.unk_policy != SE_UNK_DROP) {
+        size_t dropped_unk = 0;
+        for (size_t k = st->max_tokens; k < st->n_ids; k++) {
+            if (st->scratch->ids[k] == st->model->meta.unk_id)
+                dropped_unk++;
+        }
+        st->n_unk -= dropped_unk;
+        st->n_ids = st->max_tokens;
+    } else {
+        size_t usable = 0;
+        size_t kept_unk = 0;
+        size_t keep = 0;
+        for (size_t k = 0; k < st->n_ids; k++) {
+            uint32_t id = st->scratch->ids[k];
+            if (id == st->model->meta.unk_id) {
+                kept_unk++;
+                continue;
+            }
+            usable++;
+            if (usable == (size_t)st->max_tokens) {
+                keep = k + 1;
+                break;
+            }
+        }
+        st->n_ids = keep;
+        st->n_unk = kept_unk;
     }
-    st->n_unk -= dropped_unk;
-    st->n_ids = st->max_tokens;
+
     st->stats->truncated = 1;
     return 1;
 }
@@ -600,6 +662,54 @@ static wordpiece_status_t wordpiece(const se_model_t *m, se_scratch_t *sc, const
         start = end;
     }
     return 1;
+}
+
+static uint32_t added_token_id(const se_model_t *model, uint32_t bit) {
+    switch (bit) {
+    case SE_ADDED_PAD:
+        return model->meta.pad_id;
+    case SE_ADDED_UNK:
+        return model->meta.unk_id;
+    case SE_ADDED_CLS:
+        return model->meta.cls_id;
+    case SE_ADDED_SEP:
+        return model->meta.sep_id;
+    case SE_ADDED_MASK:
+        return model->meta.mask_id;
+    default:
+        return SE_SLOT_EMPTY;
+    }
+}
+
+static int match_added_token(const se_model_t *model, const uint8_t *input, size_t input_len,
+                             size_t pos, uint32_t *id_out, size_t *len_out) {
+    if (model->meta.added_token_mask == 0 || pos >= input_len || input[pos] != '[')
+        return 0;
+
+    for (size_t k = 0; k < SE_ARRAY_LEN(SE_ADDED_TOKENS); k++) {
+        const se_added_token_spec_t *token = &SE_ADDED_TOKENS[k];
+        if ((model->meta.added_token_mask & token->bit) == 0)
+            continue;
+        if (token->len > input_len - pos)
+            continue;
+        if (memcmp(input + pos, token->text, token->len) != 0)
+            continue;
+
+        *id_out = added_token_id(model, token->bit);
+        *len_out = token->len;
+        return 1;
+    }
+    return 0;
+}
+
+static se_status_t append_direct_id(token_state_t *st, uint32_t id, int *stop) {
+    if (!push_id(st->scratch, &st->n_ids, id))
+        return oom(st, "adding a special token");
+    if (id == st->model->meta.unk_id)
+        st->n_unk++;
+    if (cap_after_append(st))
+        *stop = 1;
+    return SE_OK;
 }
 
 static se_status_t append_wordpiece(token_state_t *st, const uint32_t *word, size_t word_len,
@@ -752,6 +862,31 @@ static se_status_t tokenize_ascii_run(token_state_t *st, const uint8_t *input, s
         if (b >= 0x80)
             break;
 
+        if (b == '[' && st->model->meta.added_token_mask != 0) {
+            uint32_t added_id = 0;
+            size_t added_len = 0;
+            if (match_added_token(st->model, input, input_len, i, &added_id, &added_len)) {
+                se_status_t rc = flush_segment(st, stop);
+                if (rc != SE_OK) {
+                    *ip = i;
+                    return rc;
+                }
+                if (*stop) {
+                    *ip = i;
+                    return SE_OK;
+                }
+                rc = append_direct_id(st, added_id, stop);
+                if (rc != SE_OK) {
+                    *ip = i;
+                    return rc;
+                }
+                i += added_len;
+                if (*stop)
+                    break;
+                continue;
+            }
+        }
+
         if (i >= next_cancel_check) {
             if (token_cancelled(st)) {
                 *ip = i;
@@ -811,8 +946,9 @@ static se_status_t tokenize_ascii_run(token_state_t *st, const uint8_t *input, s
 }
 
 se_status_t se_tokenize(const se_model_t *model, se_scratch_t *sc, const uint8_t *input,
-                        size_t input_len, uint32_t max_tokens, se_token_stats_t *stats,
-                        se_error_t *err, volatile sig_atomic_t *cancelled) {
+                        size_t input_len, uint32_t max_tokens, se_token_limit_t limit_mode,
+                        se_token_stats_t *stats, se_error_t *err,
+                        volatile sig_atomic_t *cancelled) {
     memset(stats, 0, sizeof(*stats));
 
     token_state_t st;
@@ -820,6 +956,7 @@ se_status_t se_tokenize(const se_model_t *model, se_scratch_t *sc, const uint8_t
     st.model = model;
     st.scratch = sc;
     st.max_tokens = max_tokens;
+    st.limit_mode = limit_mode;
     st.stats = stats;
     st.err = err;
     st.cancelled = cancelled;

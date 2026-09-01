@@ -18,10 +18,6 @@ end
 require "static_embeddings/errors"
 require "static_embeddings/paths"
 require "static_embeddings/format"
-require "static_embeddings/unicode_tables"
-require "static_embeddings/safetensors"
-require "static_embeddings/converter"
-require "static_embeddings/reference"
 require "static_embeddings/model"
 
 module StaticEmbeddings
@@ -64,7 +60,9 @@ module StaticEmbeddings
       load(path, verify: verify)
     end
 
-    def convert(source_dir, output_path:, model_id: nil, max_tokens: Converter::REFERENCE_MAX_TOKENS)
+    def convert(source_dir, output_path:, model_id: nil, max_tokens: nil)
+      require "static_embeddings/converter"
+      max_tokens = Converter::REFERENCE_MAX_TOKENS if max_tokens.nil?
       converter = Converter.new(source_dir)
       converter.convert(output_path: output_path, model_id: model_id, max_tokens: max_tokens)
       converter.report

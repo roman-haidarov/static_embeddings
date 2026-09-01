@@ -1,5 +1,73 @@
 # Changelog
 
+## 0.1.5
+
+Correctness/parity release. The native runtime architecture is unchanged, but
+the tokenizer/pooling contract is now pinned explicitly to `model2vec 0.9.0` +
+`tokenizers 0.23.1`, and CI contains an independent upstream boundary corpus
+instead of treating the Ruby `Reference` twin as proof of compatibility.
+
+### Fixed
+
+- **`[UNK]` is filtered before the embedding token cap.** `max_tokens: 512` now
+  means the first 512 usable (non-UNK, for `UNK_DROP`) ids, matching
+  `StaticModel` pooling semantics. Long OOV-heavy text can therefore scan past
+  512 raw ids instead of silently averaging fewer rows. `embed_with_stats` and
+  `embed_token_ids_with_stats` expose `pooled_count` alongside raw
+  `token_count` / `unk_count`.
+- **The supported Hugging Face AddedVocabulary subset is implemented.** The five
+  standard BERT special tokens (`[PAD]`, `[UNK]`, `[CLS]`, `[SEP]`, `[MASK]`)
+  are extracted literally before normalization when the source tokenizer marks
+  them `special: true, normalized: false`. Converter and runtime now share that
+  contract instead of merely whitelisting the metadata.
+- **BertNormalizer behavior matches the pinned Rust tokenizer at the known edges.**
+  The CJK Extension E range starts at `U+2B920` as in `tokenizers 0.23.1`, not
+  the Python `transformers` boundary `U+2B820`. The boundary corpus also locks
+  the actual `unicode_categories` 0.1.1 behavior for unassigned (`Cn`)
+  codepoints: despite a misleading comment in upstream `bert.rs`, that crate's
+  `is_other()` implementation checks Cc/Cf/Co, not Cn.
+- **Vocabulary hash lookup is bounded by the validated `max_probe`,** and model
+  loading rejects hash tables above the converter's 0.70 load factor.
+- **`load_model` model ids cannot escape the cache** through absolute paths,
+  `..`, empty path components, backslash traversal or NUL bytes.
+
+### Changed
+
+- **`.semb` format v3.** The header records the supported added-token mask and
+  the usable-id truncation policy. v2 files must be reconverted; this avoids a
+  runtime silently applying 0.1.5 semantics to a file whose tokenizer contract
+  was recorded by an older converter.
+- **Model2Vec's character pre-truncation heuristic is intentionally not copied.**
+  `max_tokens` means actual usable tokenizer ids. The external oracle records
+  rows where `StaticModel`'s `max_length * median_token_length` character cut
+  changes ids and reports them as an explicit semantic deviation rather than a
+  false parity failure/pass.
+- **The converter reads safetensors incrementally and accepts F32, F16 and BF16
+  embedding tensors.** `.semb` rows remain float32. `Format.write` also streams
+  sections and computes the checksum incrementally instead of assembling a
+  second whole-file Ruby string.
+- **Plain `require "static_embeddings"` loads runtime code only.** Converter,
+  safetensors, Unicode-table generation and the Ruby `Reference` are loaded only
+  by offline tooling/tests. The `static_embeddings convert` CLI explicitly loads
+  the converter before reading converter-specific defaults, so lazy loading does
+  not break the documented executable path.
+- **TLS token-id scratch keeps a bounded high-water mark.** It still reserves only
+  512 ids initially, but capacities grown by OOV-heavy usable-token truncation are
+  retained up to 8192 ids between calls. This removes grow/trim realloc churn on
+  realistic truncated inputs without pinning arbitrarily large per-thread buffers.
+
+### Verification
+
+- Added a deterministic **434-row boundary corpus** covering control/unassigned
+  boundaries, every supported CJK range edge ±1, punctuation classes, whitespace, combining
+  marks, AddedVocabulary, 511/512/513 boundaries, OOV ratios and long-prefix
+  cases.
+- CI now installs pinned `model2vec==0.9.0` / `tokenizers==0.23.1`, generates an
+  external oracle, and separately checks raw HF ids, usable ids, embedding
+  parity where the contracts are identical, and intentional character-precut
+  deviations. The existing 50k native-vs-Ruby differential fuzz remains as a
+  separate implementation-consistency layer.
+
 ## 0.1.4 (unreleased)
 
 Hot-path work in the C runtime. Token ids, the pooling contract and f16

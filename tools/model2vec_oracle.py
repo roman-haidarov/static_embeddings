@@ -1,112 +1,94 @@
-"""Dump reference token ids and vectors from Python model2vec.StaticModel.
+"""Generate an external compatibility oracle from pinned Model2Vec/HF code.
 
-The Ruby reference implementation in this repository is an implementation twin
-of the C runtime, so it cannot prove compatibility with HuggingFace tokenizers
-or model2vec. This script produces the only external oracle we accept.
+The runtime intentionally exposes two related contracts:
 
-It records token ids as well as vectors, because the correctness contract in
-the README is stated on ids ("token ids must match the reference exactly") and
-two different tokenizations can still land inside cosine tolerance.
+* Model#tokenize returns raw Hugging Face tokenizer ids (including [UNK]) and
+  applies max_tokens to raw ids.
+* embedding filters [UNK] first and then applies max_tokens to usable ids.
 
-Usage:
-    python tools/model2vec_oracle.py ./potion-retrieval-32M --out tmp/oracle.json
+Model2Vec additionally applies a character pre-cut before tokenization. The gem
+intentionally does not reproduce that heuristic. Rows where that heuristic
+changes Model2Vec's usable ids are recorded, but strict vector parity is not
+claimed for those rows.
 """
 
 import argparse
 import json
+from importlib.metadata import version
+
 import numpy as np
 from model2vec import StaticModel
 
-BASE_TEXTS = [
-    "",
-    " ",
-    "\t\n\r",
-    "postgres pipeline mode in ruby",
-    "ruby postgres pipelining and database queries",
-    "electrolysis hair removal aftercare",
-    "banana smoothie with milk",
-    "Hello WORLD",
-    "hello, world!",
-    "hello\u007fworld",
-    "hello\u007f world",
-    "\u007f",
-    "caf\u00e9",
-    "CAF\u00c9",
-    "cafe\u0301",
-    "na\u00efve",
-    "\u0440\u0443\u0441\u0441\u043a\u0438\u0439 \u0442\u0435\u043a\u0441\u0442 \u043f\u0440\u043e \u043f\u043e\u0441\u0442\u0433\u0440\u0435\u0441",
-    "\u041f\u0420\u0418\u0412\u0415\u0422, \u041c\u0418\u0420!",
-    "\u4e2d\u6587\u6d4b\u8bd5",
-    "\U0001f9ac\U0001f9ac\U0001f9ac",
-    "zero\u200bwidth",
-    "non\u00a0breaking\u2009space",
-    "testing ##ing edge",
-    "zzzzz unknownword qqqqq",
-    "a" * 300,
-]
+from parity_cases import build_cases
 
-SEED = (
-    "postgres pipeline mode in ruby static embeddings local rag search "
-    "vector database latency throughput "
-)
+SCHEMA_VERSION = 2
+PINNED_MODEL2VEC = "0.9.0"
+PINNED_TOKENIZERS = "0.23.1"
 
 
-def repeat_to_bytes(seed, target):
-    out = []
-    size = 0
-    while size < target:
-        out.append(seed)
-        size += len(seed.encode("utf-8"))
-    return "".join(out)
-
-
-LARGE_TEXTS = [
-    repeat_to_bytes(SEED, 8 * 1024),
-    repeat_to_bytes(SEED, 96 * 1024),
-    repeat_to_bytes(SEED, 512 * 1024),
-    "a" * (96 * 1024),
-    ("word" + " " * 400) * 200,
-    "\u0441\u043b\u043e\u0432\u043e\u00a0" * 20000,
-]
+def _as_id_rows(value):
+    if isinstance(value, np.ndarray):
+        value = value.tolist()
+    return [[int(token_id) for token_id in row] for row in value]
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("source_dir")
     parser.add_argument("--out", default="tmp/model2vec_oracle.json")
-    parser.add_argument("--text", action="append", dest="texts")
     parser.add_argument("--max-length", type=int, default=512)
-    parser.add_argument("--skip-large", action="store_true")
+    parser.add_argument("--allow-version-mismatch", action="store_true")
     args = parser.parse_args()
 
-    if args.texts:
-        texts = args.texts
-    else:
-        texts = list(BASE_TEXTS)
-        if not args.skip_large:
-            texts += LARGE_TEXTS
+    model2vec_version = version("model2vec")
+    tokenizers_version = version("tokenizers")
+    if not args.allow_version_mismatch:
+        if model2vec_version != PINNED_MODEL2VEC:
+            raise SystemExit(f"model2vec {model2vec_version} != pinned {PINNED_MODEL2VEC}")
+        if tokenizers_version != PINNED_TOKENIZERS:
+            raise SystemExit(f"tokenizers {tokenizers_version} != pinned {PINNED_TOKENIZERS}")
 
+    cases = build_cases()
+    texts = [case["text"] for case in cases]
     model = StaticModel.from_pretrained(args.source_dir)
+
+    raw_encodings = model.tokenizer.encode_batch(texts, add_special_tokens=False)
+    model2vec_ids = _as_id_rows(model.tokenize(texts, max_length=args.max_length))
     embeddings = model.encode(texts, max_length=args.max_length)
-    encodings = model.tokenizer.encode_batch(texts, add_special_tokens=False)
+    unk_id = model.unk_token_id
 
     rows = []
-    for text, vector, encoding in zip(texts, embeddings, encodings):
-        ids = list(encoding.ids)
-        rows.append(
-            {
-                "text": text,
-                "token_ids": ids[: args.max_length],
-                "token_ids_untruncated_length": len(ids),
-                "vector": np.asarray(vector, dtype=np.float32).tolist(),
-            }
-        )
+    for case, encoding, m2v_ids, vector in zip(cases, raw_encodings, model2vec_ids, embeddings):
+        raw = [int(token_id) for token_id in encoding.ids]
+        usable = [token_id for token_id in raw if unk_id is None or token_id != int(unk_id)]
+        static_usable = usable[: args.max_length]
+        rows.append({
+            "label": case["label"],
+            "text": case["text"],
+            "hf_raw_token_ids": raw[: args.max_length],
+            "hf_raw_untruncated_length": len(raw),
+            "static_usable_token_ids": static_usable,
+            "model2vec_token_ids": m2v_ids,
+            "model2vec_vector": np.asarray(vector, dtype=np.float32).tolist(),
+            "model2vec_character_pretruncate_changes_ids": m2v_ids != static_usable,
+        })
 
+    payload = {
+        "schema_version": SCHEMA_VERSION,
+        "reference": {
+            "model2vec": model2vec_version,
+            "tokenizers": tokenizers_version,
+            "max_length": args.max_length,
+            "unk_token_id": None if unk_id is None else int(unk_id),
+        },
+        "rows": rows,
+    }
     with open(args.out, "w", encoding="utf-8") as f:
-        json.dump({"max_length": args.max_length, "rows": rows}, f, ensure_ascii=False)
+        json.dump(payload, f, ensure_ascii=False, separators=(",", ":"))
 
-    dim = len(rows[0]["vector"]) if rows else 0
-    print("wrote %s rows=%d dim=%d max_length=%d" % (args.out, len(rows), dim, args.max_length))
+    deviations = sum(row["model2vec_character_pretruncate_changes_ids"] for row in rows)
+    dim = len(rows[0]["model2vec_vector"]) if rows else 0
+    print(f"wrote {args.out} rows={len(rows)} dim={dim} character_pretruncate_deviations={deviations}")
 
 
 if __name__ == "__main__":
