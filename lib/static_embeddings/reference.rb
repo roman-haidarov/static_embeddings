@@ -1,6 +1,5 @@
-require "json"
-require "static_embeddings/converter"
-require "static_embeddings/safetensors"
+require "static_embeddings/importers"
+require "static_embeddings/format/constants"
 
 module StaticEmbeddings
   class Reference
@@ -26,49 +25,52 @@ module StaticEmbeddings
       @dim = meta.fetch(:dim)
     end
 
-    def self.from_source_dir(dir, max_tokens: Converter::REFERENCE_MAX_TOKENS)
-      tokenizer = JSON.parse(File.binread(File.join(dir, "tokenizer.json")))
-      config_path = File.join(dir, "config.json")
-      config = File.file?(config_path) ? JSON.parse(File.binread(config_path)) : {}
-      tokens = tokens_from(tokenizer)
-      tensor = Safetensors.read(File.join(dir, "model.safetensors"))[:tensors].values.first
-      rows, dim = tensor[:shape]
-      floats = Safetensors.f32_bytes(tensor).unpack("e*")
-      normalizer = tokenizer["normalizer"] || {}
-
-      new(tokens: tokens,
-          matrix: Array.new(rows) { |i| floats[i * dim, dim] },
-          meta: meta_from(tokenizer, config, normalizer, dim, max_tokens))
+    def self.from_source_dir(dir, max_tokens: nil, dimensions: nil)
+      from_canonical(Importers.import(dir, max_tokens: max_tokens, dimensions: dimensions))
     end
 
-    def self.tokens_from(tokenizer)
-      vocab = tokenizer.dig("model", "vocab")
-      vocab.each_with_object(Array.new(vocab.length)) { |(token, id), tokens| tokens[id] = token }
+    def self.from_canonical(model)
+      dim = model.dimensions.output
+      floats = matrix_bytes(model.matrix).unpack("e*")
+      rows = model.tokens.length
+      new(
+        tokens: model.tokens,
+        matrix: Array.new(rows) { |index| floats[index * dim, dim] },
+        meta: meta_from_canonical(model)
+      )
     end
 
-    def self.meta_from(tokenizer, config, normalizer, dim, max_tokens)
-      lowercase = normalizer.fetch("lowercase", true)
+    def self.matrix_bytes(matrix)
+      return matrix unless matrix.respond_to?(:each_chunk)
+
+      matrix.each_chunk.each_with_object(Format.binary_string) { |chunk, packed| packed << chunk }
+    end
+
+    def self.meta_from_canonical(model)
+      tokenizer = model.tokenizer
+      runtime = model.runtime
       {
-        dim: dim,
-        lowercase: lowercase,
-        strip_accents: normalizer["strip_accents"].nil? ? lowercase : normalizer["strip_accents"],
-        clean_text: normalizer.fetch("clean_text", true),
-        handle_chinese_chars: normalizer.fetch("handle_chinese_chars", true),
-        max_input_chars_per_word: tokenizer.dig("model", "max_input_chars_per_word") || 100,
-        unk_token: tokenizer.dig("model", "unk_token") || "[UNK]",
-        normalize: config.key?("normalize") ? config["normalize"] : true,
-        max_tokens: max_tokens,
-        added_tokens: supported_added_tokens(tokenizer)
+        dim: model.dimensions.output,
+        lowercase: tokenizer.fetch(:do_lower_case),
+        strip_accents: tokenizer.fetch(:strip_accents),
+        clean_text: tokenizer.fetch(:clean_text),
+        handle_chinese_chars: tokenizer.fetch(:handle_chinese_chars),
+        max_input_chars_per_word: tokenizer.fetch(:max_input_chars_per_word),
+        unk_token: model.tokens.fetch(tokenizer.fetch(:unk_id)),
+        normalize: runtime.normalization == Format::NORMALIZATION_L2,
+        max_tokens: runtime.max_tokens,
+        unk_policy: runtime.unk_policy,
+        added_tokens: added_tokens(model)
       }
     end
 
-    def self.supported_added_tokens(tokenizer)
-      allowed = Converter::STANDARD_SPECIAL_TOKENS
-      (tokenizer["added_tokens"] || []).each_with_object({}) do |token, out|
-        content = token["content"]
-        next unless token["special"] && allowed.key?(content) && token["normalized"] == false
+    def self.added_tokens(model)
+      mask = model.tokenizer.fetch(:added_token_mask)
+      BertWordPiece::STANDARD_SPECIAL_TOKENS.each_with_object({}) do |(content, bit), tokens|
+        next if (mask & bit).zero?
 
-        out[content] = Integer(token.fetch("id"))
+        id = model.tokens.index(content)
+        tokens[content] = id unless id.nil?
       end
     end
 
@@ -91,12 +93,20 @@ module StaticEmbeddings
     end
 
     def embed(text, max_tokens: @meta[:max_tokens])
-      used = tokenize(text, max_tokens: false).reject { |id| id == unk_id }
-      used = used.first(max_tokens) if max_tokens && max_tokens.positive? && used.length > max_tokens
-      return Array.new(@dim, 0.0) if used.empty?
+      ids = apply_unk_policy(tokenize(text, max_tokens: false))
+      ids = ids.first(max_tokens) if max_tokens && max_tokens.positive? && ids.length > max_tokens
+      return Array.new(@dim, 0.0) if ids.empty?
 
-      vector = pooled(used)
+      vector = pooled(ids)
       @meta[:normalize] ? l2_normalize(vector) : vector
+    end
+
+    def apply_unk_policy(ids)
+      case @meta.fetch(:unk_policy)
+      when Format::UNK_DROP then ids.reject { |id| id == unk_id }
+      when Format::UNK_INCLUDE then ids
+      else raise InvalidModelError, "unknown unk_policy #{@meta[:unk_policy].inspect}"
+      end
     end
 
     private

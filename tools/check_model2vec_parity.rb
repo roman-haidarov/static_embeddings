@@ -80,7 +80,11 @@ rows.each_with_index do |row, i|
 
   full_raw = model.tokenize(text, max_tokens: false)
   expected_usable = row.fetch("static_usable_token_ids")
-  got_usable = full_raw.reject { |id| id == model.unk_id }.first(max_length)
+  got_usable = if reference["unk_token_id"].nil?
+                 full_raw.first(max_length)
+               else
+                 full_raw.reject { |id| id == model.unk_id }.first(max_length)
+               end
   if got_usable != expected_usable
     usable_failures << i
     first = got_usable.zip(expected_usable).index { |a, b| a != b } || [got_usable.length, expected_usable.length].min

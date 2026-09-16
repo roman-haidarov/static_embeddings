@@ -8,10 +8,10 @@ HuggingFace / Model2Vec files          offline, once, on your machine
   model.safetensors
         |
         v
-  Converter (pure Ruby, strict)   <--- all parsing, all validation, all
-        |                              Unicode table generation happens here
+  import -> canonical data -> writer   <--- pure Ruby, offline, strict
+        |                                    all source parsing/validation here
         v
-  model.semb                       <--- flat, versioned, mmap-able
+  model.semb                            <--- flat, versioned, mmap-able
         |
         v
   C runtime                        <--- mmap + bounds checks + tokenize +
@@ -23,6 +23,15 @@ The single most important decision: **the runtime reads only our own format.**
 Everything expensive, fragile or security-sensitive about reading third-party
 model files happens once, offline, in a language where it is easy to get
 right. What remains in C is a bounds-checked mmap and three loops.
+
+Only the offline import layer knows HuggingFace layouts. Model2Vec and Sentence
+Transformers `StaticEmbedding` sources are reduced to immutable canonical data:
+tokens, streamed matrix, tokenizer metadata, runtime policies and provenance.
+Pure transforms then build the v3 header/provenance and the existing WordPiece
+writer emits the artifact. A new WordPiece + mean-pooling source therefore does
+not require a C change. New tokenizer families remain explicit future
+capabilities and require a separately audited format/runtime change rather than
+source-name special cases.
 
 The C side is `se_format.c` (mmap and validation), `se_tokenizer.c`,
 `se_embed.c`, `se_unicode.c`, `se_f16.c` (half-precision codec and kernels),
@@ -336,8 +345,8 @@ chunks -> .semb vectors --/
 1. **Which potion models actually match `BERT_WORDPIECE_V1`.** The runtime now
    implements the exact `normalized: false` extraction semantics needed by the
    five standard BERT added tokens, but still rejects arbitrary AddedVocabulary,
-   BPE and Unigram profiles. Each source model still needs an audit before it is
-   treated as compatible.
+   BPE and Unigram profiles. Type A (WordPiece + mean) models convert without a
+   C change; each source still needs an audit before it is treated as compatible.
 2. **Russian.** Distilling a multilingual teacher into a WordPiece vocabulary
    we control keeps the pure-C path, but skips the Tokenlearn pre-training
    that gives the published potion models their quality. That gap has to be
