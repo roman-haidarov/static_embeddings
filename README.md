@@ -1,11 +1,11 @@
 # static_embeddings
 
-A Ruby runtime for converted Model2Vec / potion static embedding models. A model
+A Ruby runtime for converted Model2Vec and Sentence Transformers static embedding models. A model
 is converted once into a local `.semb` file and loaded through a small C
 extension. No ONNX Runtime, no Rust or Python at runtime, no network access, one
 mmap-able file, binary float32 output.
 
-The current production target is `minishlab/potion-retrieval-32M`.
+The reference production target remains `minishlab/potion-retrieval-32M`; 1.5.6 also supports audited WordPiece `StaticEmbedding` sources.
 
 ```ruby
 require "static_embeddings"
@@ -48,6 +48,21 @@ bundle exec rake compile
 bundle exec ruby -Ilib exe/static_embeddings convert ./potion-retrieval-32M \
   --id potion-retrieval-32m
 ```
+
+Sentence Transformers static models (`modules.json` + one `StaticEmbedding`
+module) use the same command. Matryoshka prefix-slice is a convert-time flag,
+not a runtime `dim:`:
+
+```bash
+bundle exec ruby -Ilib exe/static_embeddings convert ./static-retrieval-mrl-en-v1 \
+  --id static-retrieval-mrl-en-v1-512 \
+  --dimensions 512 \
+  --trained-mrl-dims 1024,512,256,128,64,32
+```
+
+`--max-tokens unlimited` bakes no token cap (Sentence Transformers default).
+`--max-tokens 0` is a convert-time alias; `embed(max_tokens: 0)` is still
+rejected. Query and documents must use the same loaded `.semb`.
 
 The result lands in `~/.cache/static_embeddings/models/potion-retrieval-32m.semb`.
 Inspect or verify it with the `inspect` and `verify` subcommands, then load it:

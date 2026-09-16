@@ -1,16 +1,16 @@
+require "fileutils"
 require "json"
 require "optparse"
-require "fileutils"
 
 module StaticEmbeddings
-  class CLI
+  module CLI
     COMMANDS = {
-      "convert" => :convert,
-      "verify" => :verify,
-      "inspect" => :inspect_model,
-      "tokenize" => :tokenize,
-      "embed" => :embed,
-      "cache-path" => :cache_path,
+      "convert" => :convert_command,
+      "verify" => :verify_command,
+      "inspect" => :inspect_command,
+      "tokenize" => :tokenize_command,
+      "embed" => :embed_command,
+      "cache-path" => :cache_path_command,
       "help" => :usage,
       "-h" => :usage,
       "--help" => :usage,
@@ -20,10 +20,14 @@ module StaticEmbeddings
     HELP = <<~TEXT
       static_embeddings <command> [options]
 
-        convert SOURCE_DIR    Convert a HuggingFace/Model2Vec directory to .semb
+        convert SOURCE_DIR    Convert Model2Vec or Sentence Transformers StaticEmbedding to .semb
           --out PATH          Output file (default: <cache>/models/<id>.semb)
           --id ID             Model id recorded in provenance
-          --max-tokens N      Truncation limit baked into the file (default 512)
+          --max-tokens N      Model2Vec default: 512; Sentence Transformers default: unlimited
+          --max-tokens unlimited
+          --dimensions N      Keep the first N dims (Matryoshka prefix slice)
+          --revision SHA      Source revision recorded in provenance
+          --trained-mrl-dims  1024,512,256,... training dims recorded in provenance
 
         verify PATH           Recompute the SHA-256 embedded in the header
         inspect PATH          Print header fields and provenance
@@ -32,67 +36,78 @@ module StaticEmbeddings
         cache-path            Print the model cache directory
     TEXT
 
-    def self.run(argv)
-      new.run(argv)
-    end
+    module_function
 
     def run(argv)
-      method = COMMANDS[argv.shift]
-      return unknown unless method
+      command = COMMANDS[argv.shift]
+      return unknown_command unless command
 
-      send(method, argv)
-    rescue StaticEmbeddings::Error => e
+      public_send(command, argv)
+    rescue StaticEmbeddings::Error, ArgumentError, OptionParser::ParseError => e
       warn "#{e.class.name.split('::').last}: #{e.message}"
       1
     end
-
-    private
 
     def usage(*)
       puts HELP
       0
     end
 
-    def unknown
+    def unknown_command
       warn "unknown command"
       usage
       1
     end
 
-    def cache_path(*)
+    def cache_path_command(*)
       puts StaticEmbeddings.cache_dir
       0
     end
 
-    def convert(argv)
-      require "static_embeddings/converter"
-      options = parse_convert_options(argv)
+    def convert_command(argv)
+      options = convert_options(argv)
       source = required_arg(argv, "usage: static_embeddings convert SOURCE_DIR [--out PATH]")
       model_id = options[:id] || File.basename(File.expand_path(source))
-      out = options[:out] || StaticEmbeddings.model_path(model_id)
-      FileUtils.mkdir_p(File.dirname(out))
+      output = options[:out] || StaticEmbeddings.model_path(model_id)
+      FileUtils.mkdir_p(File.dirname(output))
 
-      report = StaticEmbeddings.convert(source, output_path: out, model_id: model_id,
-                                                max_tokens: options[:max_tokens])
-      puts conversion_report(out, report, options[:max_tokens])
+      report = StaticEmbeddings.convert(source, output_path: output, model_id: model_id, **conversion_options(options))
+      puts conversion_report(output, report)
       0
     end
 
-    def parse_convert_options(argv)
-      options = { max_tokens: Converter::REFERENCE_MAX_TOKENS }
-      OptionParser.new do |parser|
-        parser.on("--out PATH") { |value| options[:out] = value }
-        parser.on("--id ID") { |value| options[:id] = value }
-        parser.on("--max-tokens N", Integer) { |value| options[:max_tokens] = value }
-      end.parse!(argv)
-      options
+    def convert_options(argv)
+      {}.tap do |options|
+        OptionParser.new do |parser|
+          parser.on("--out PATH") { |value| options[:out] = value }
+          parser.on("--id ID") { |value| options[:id] = value }
+          parser.on("--max-tokens N") { |value| options[:max_tokens] = parse_max_tokens(value) }
+          parser.on("--dimensions N", Integer) { |value| options[:dimensions] = value }
+          parser.on("--revision SHA") { |value| options[:source_revision] = value }
+          parser.on("--trained-mrl-dims LIST") { |value| options[:trained_mrl_dims] = value }
+        end.parse!(argv)
+      end
     end
 
-    def conversion_report(path, report, max_tokens)
+    def conversion_options(options)
+      options.select { |key, _| %i[max_tokens dimensions source_revision trained_mrl_dims].include?(key) }
+    end
+
+    def parse_max_tokens(value)
+      return :unlimited if value == "unlimited" || value == "0"
+
+      integer = Integer(value)
+      raise OptionParser::InvalidArgument, "--max-tokens must be positive or unlimited" unless integer.positive?
+      integer
+    end
+
+    def conversion_report(path, report)
+      max_tokens = report[:max_tokens].to_i.zero? ? "unlimited" : report[:max_tokens]
+      dim = report[:native_dim] == report[:dim] ? report[:dim].to_s : "#{report[:dim]} (from native #{report[:native_dim]})"
       [
         "wrote #{path}",
         "  vocab      #{report[:vocab_size]}",
-        "  dim        #{report[:dim]}",
+        "  dim        #{dim}",
         "  bytes      #{report[:bytes]}",
         "  sha256     #{report[:sha256]}",
         "  max_tokens #{max_tokens}",
@@ -101,20 +116,25 @@ module StaticEmbeddings
       ].join("\n")
     end
 
-    def verify(argv)
+    def verify_command(argv)
       result = StaticEmbeddings.verify(required_arg(argv, "usage: static_embeddings verify PATH"))
-      return puts("ok #{result[:expected]}") || 0 if result[:ok]
-
-      warn "CHECKSUM MISMATCH"
-      warn "  stored   #{result[:stored]}"
-      warn "  computed #{result[:expected]}"
-      1
+      if result[:ok]
+        puts "ok #{result[:expected]}"
+        0
+      else
+        warn "CHECKSUM MISMATCH"
+        warn "  stored   #{result[:stored]}"
+        warn "  computed #{result[:expected]}"
+        1
+      end
     end
 
-    def inspect_model(argv)
+    def inspect_command(argv)
       model = StaticEmbeddings.load(required_arg(argv, "usage: static_embeddings inspect PATH"))
       puts JSON.pretty_generate(model_summary(model))
       0
+    ensure
+      model&.close
     end
 
     def model_summary(model)
@@ -131,18 +151,20 @@ module StaticEmbeddings
       }
     end
 
-    def tokenize(argv)
-      model, text = model_and_text(argv, "usage: static_embeddings tokenize PATH TEXT")
-      ids = model.tokenize(text)
-      puts JSON.generate("ids" => ids, "count" => ids.length, "unk" => ids.count(model.unk_id))
+    def tokenize_command(argv)
+      with_model_and_text(argv, "usage: static_embeddings tokenize PATH TEXT") do |model, text|
+        ids = model.tokenize(text)
+        puts JSON.generate("ids" => ids, "count" => ids.length, "unk" => ids.count(model.unk_id))
+      end
       0
     end
 
-    def embed(argv)
-      model, text = model_and_text(argv, "usage: static_embeddings embed PATH TEXT")
-      stats = model.embed_with_stats(text)
-      warn_high_unk(stats) if high_unk?(stats)
-      puts JSON.generate(stats_payload(model, stats))
+    def embed_command(argv)
+      with_model_and_text(argv, "usage: static_embeddings embed PATH TEXT") do |model, text|
+        stats = model.embed_with_stats(text)
+        warn_high_unk(stats) if high_unk?(stats)
+        puts JSON.generate(stats_payload(model, stats))
+      end
       0
     end
 
@@ -151,7 +173,7 @@ module StaticEmbeddings
         "token_count" => stats[:token_count],
         "unk_count" => stats[:unk_count],
         "truncated" => stats[:truncated],
-        "vector" => StaticEmbeddings.unpack(stats[:vector], model.dim).first.map { |v| v.round(6) }
+        "vector" => StaticEmbeddings.unpack(stats[:vector], model.dim).first.map { |value| value.round(6) }
       }
     end
 
@@ -164,16 +186,19 @@ module StaticEmbeddings
       warn "warning: #{(ratio * 100).round}% of tokens are [UNK] — wrong model for this language?"
     end
 
-    def model_and_text(argv, usage)
+    def with_model_and_text(argv, usage)
       path = argv.shift
       text = argv.join(" ")
-      abort usage if path.nil? || text.empty?
+      raise InvalidOptionError, usage if path.nil? || text.empty?
 
-      [StaticEmbeddings.load(path), text]
+      model = StaticEmbeddings.load(path)
+      yield model, text
+    ensure
+      model&.close
     end
 
     def required_arg(argv, usage)
-      argv.shift || abort(usage)
+      argv.shift || raise(InvalidOptionError, usage)
     end
   end
 end

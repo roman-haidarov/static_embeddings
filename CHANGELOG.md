@@ -1,5 +1,55 @@
 # Changelog
 
+## 1.5.6
+
+Multi-source WordPiece release. The native `.semb` v3 runtime is unchanged; new
+source families are normalized offline into the same audited
+`BERT_WORDPIECE_V1 -> lookup -> mean -> NONE/L2` contract. Model identity is
+chosen at `load_model`, not per `embed` call.
+
+### Added
+
+- **Model2Vec and Sentence Transformers importers.** A Model2Vec directory and a
+  Sentence Transformers `StaticEmbedding` directory (`modules.json` + exactly
+  one module path) compile to the same canonical data. The ST importer is
+  fail-closed and confines the module path to the source root with `realpath`.
+- **Source-faithful policies.** Model2Vec uses `UNK_DROP`, normalization from its
+  config and a 512-token default. Sentence Transformers `StaticEmbedding` uses
+  `UNK_INCLUDE`, `NORMALIZATION_NONE`, unlimited tokens and
+  `add_special_tokens=false`.
+- **`--dimensions N`.** Matryoshka prefix slicing happens while streaming the
+  embedding matrix; the runtime still loads an ordinary fixed-dimension `.semb`.
+- **`--max-tokens unlimited`.** Convert-time `0` remains an alias; runtime
+  `max_tokens: 0` is still rejected and `false` means unlimited.
+- **Russian retrieval fixture.** `tools/eval_retrieval.rb` and the checked-in
+  Russian FAQ corpus provide a small domain sanity check for the multilingual
+  WordPiece model; it is not presented as a general benchmark.
+
+### Changed
+
+- **Offline Ruby conversion was simplified.** Stateful `Converter` and the
+  behavior-heavy `CanonicalModel` were replaced by import functions, immutable
+  canonical data, pure provenance/meta transforms and a streaming format writer.
+  Writer/hash/trie/verifier code is split from runtime format constants, so plain
+  `require "static_embeddings"` does not load conversion code.
+- The Ruby `Reference` twin follows canonical UNK/normalization/max-token
+  policies instead of re-deriving Model2Vec defaults.
+- Model2Vec `normalize` now defaults to `false` when the key is absent, matching
+  the pinned upstream behavior. Unknown source families are rejected rather than
+  guessed from `tokenizer.json + model.safetensors`.
+- Header integer writes validate their unsigned range instead of silently
+  wrapping oversized Ruby integers.
+- `Model#provenance` is parsed once and cached.
+
+Local WordPiece conversions requiring **no C change**: `potion-base-8M`,
+`potion-science-32M`, `static-retrieval-mrl-en-v1` at 1024/512 and
+`static-similarity-mrl-multilingual-v1` at 512/256. The retrieval model has a
+recorded `SentenceTransformer.encode` oracle (436/436). Records are in
+`docs/MODEL_AUDIT.md`.
+
+SentencePiece/Unigram is intentionally **not** part of 1.5.6; it remains a
+future runtime capability rather than shipping an unaudited v4 path.
+
 ## 0.1.5
 
 Correctness/parity release. The native runtime architecture is unchanged, but

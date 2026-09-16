@@ -7,8 +7,8 @@ Gem::Specification.new do |spec|
   spec.email   = ["romnhajdarov@gmail.com"]
 
   spec.summary     = "Fast local text embeddings for Ruby — no ONNX, no Rust, no network"
-  spec.description = "A small C-extension runtime for Model2Vec-style static embedding " \
-                     "models. Models are converted offline into a flat mmap-able .semb " \
+  spec.description = "A small C-extension runtime for Model2Vec and Sentence Transformers static " \
+                     "WordPiece embedding models. Models are converted offline into a flat mmap-able .semb " \
                      "file; at runtime the gem tokenizes (BERT WordPiece), looks up rows " \
                      "and mean-pools them. Releases the GVL on large native work, rejects internal " \
                      "thread fan-out, and links nothing but libc."

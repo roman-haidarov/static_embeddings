@@ -12,29 +12,25 @@ module StaticEmbeddings
 
     def model_path(model_id, env = ENV)
       id = model_id.to_s
-      raise ArgumentError, "model_id must not be empty" if id.empty?
-      raise ArgumentError, "model_id contains a NUL byte" if id.include?("\0")
+      raise InvalidOptionError, "model_id must not be empty" if id.empty?
+      raise InvalidOptionError, "model_id contains a NUL byte" if id.include?("\0")
 
       normalized = id.tr("\\", "/")
       parts = normalized.split("/", -1)
-      if normalized.start_with?("/") ||
-         parts.any? { |part| part.empty? || part == "." || part == ".." || part.include?(":") }
-        raise ArgumentError, "model_id must be a relative slash-separated identifier"
-      end
+      invalid = normalized.start_with?("/") ||
+                parts.any? { |part| part.empty? || part == "." || part == ".." || part.include?(":") }
+      raise InvalidOptionError, "model_id must be a relative slash-separated identifier" if invalid
 
       base = File.expand_path(File.join(cache_dir(env), "models"))
       path = File.expand_path(File.join(base, "#{normalized}.semb"))
       prefix = base.end_with?(File::SEPARATOR) ? base : "#{base}#{File::SEPARATOR}"
-      unless path.start_with?(prefix)
-        raise ArgumentError, "model_id escapes the model cache"
-      end
+      raise InvalidOptionError, "model_id escapes the model cache" unless path.start_with?(prefix)
+
       path
     end
 
     def builtin_path(name)
-      file = BUILTIN_MODELS.fetch(name) do
-        raise ModelNotFound, "unknown builtin model #{name.inspect}"
-      end
+      file = BUILTIN_MODELS.fetch(name) { raise ModelNotFound, "unknown builtin model #{name.inspect}" }
       File.join(BUILTIN_DIR, file)
     end
 

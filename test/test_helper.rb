@@ -34,7 +34,7 @@ module TestSupport
 
     data = File.binread(path, 16)
     data.byteslice(0, 8) == StaticEmbeddings::Format::MAGIC.b &&
-      data.byteslice(8, 4).unpack1("V") == StaticEmbeddings::Format::VERSION &&
+      data.byteslice(8, 4).unpack1("V") == StaticEmbeddings::Format::VERSION_WORDPIECE &&
       data.byteslice(12, 4).unpack1("V") == StaticEmbeddings::Format::HEADER_SIZE
   end
 

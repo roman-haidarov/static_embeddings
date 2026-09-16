@@ -76,12 +76,28 @@ class FormatTest < Minitest::Test
     provenance = TestSupport.model.provenance
     %w[format_version converter_version source_model_id source_files_sha256
        reference_impl reference_max_tokens unicode_source tokenizer_profile
-       vocab_size dim].each do |key|
+       vocab_size dim source_family native_dim output_dim add_special_tokens
+       oracle unk_policy].each do |key|
       assert provenance.key?(key), "provenance is missing #{key}"
     end
     assert_equal "model2vec.StaticModel", provenance["reference_impl"]
+    assert_equal "model2vec", provenance["source_family"]
     assert_equal 512, provenance["reference_max_tokens"]
+    assert_equal provenance["dim"], provenance["output_dim"]
+    assert_equal false, provenance["add_special_tokens"]
+    assert_equal "drop", provenance["unk_policy"]
     assert_equal 4, provenance["source_files_sha256"].length
+  end
+
+  def test_writer_rejects_u32_overflow
+    require "static_embeddings/format/writer"
+    header = "\0".b * StaticEmbeddings::Format::HEADER_SIZE
+    error = assert_raises(ArgumentError) do
+      StaticEmbeddings::Format::Writer.put_u32(
+        header, 0, StaticEmbeddings::Format::UINT32_MAX + 1
+      )
+    end
+    assert_match(/u32 value out of range/, error.message)
   end
 
   def test_conversion_is_deterministic

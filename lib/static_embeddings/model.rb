@@ -4,39 +4,41 @@ module StaticEmbeddings
   class Model
     attr_reader :path
 
-    def provenance
-      raw = provenance_json
-      return {} if raw.nil?
+    if method_defined?(:max_tokens) && !method_defined?(:max_tokens_limit)
+      alias_method :max_tokens_limit, :max_tokens
 
-      JSON.parse(raw)
-    rescue JSON::ParserError, EncodingError => e
-      raise InvalidModelError, "invalid provenance JSON: #{e.message}"
+      def max_tokens
+        limit = max_tokens_limit
+        limit.zero? ? false : limit
+      end
+    end
+
+    def provenance
+      @provenance ||= parse_provenance.freeze
     end
 
     def model_id
       provenance["source_model_id"]
     end
 
-    def embed_array(text, **opts)
-      format = opts.key?(:format) ? opts[:format] : :f32
-      StaticEmbeddings.unpack(embed(text, **opts), dim, format: format).first
+    def embed_array(text, **options)
+      format = options.fetch(:format, :f32)
+      StaticEmbeddings.unpack(embed(text, **options), dim, format: format).first
     end
 
-    def embed_batch_arrays(texts, **opts)
-      format = opts.key?(:format) ? opts[:format] : :f32
-      StaticEmbeddings.unpack(embed_batch(texts, **opts), dim, format: format)
+    def embed_batch_arrays(texts, **options)
+      format = options.fetch(:format, :f32)
+      StaticEmbeddings.unpack(embed_batch(texts, **options), dim, format: format)
     end
 
-    def cosine_top_k(query_blob, matrix_blob, k, **opts)
-      raise ArgumentError, "dim: is set by the model" if opts.key?(:dim)
-
-      StaticEmbeddings.cosine_top_k(query_blob, matrix_blob, k, **opts.merge(dim: dim))
+    def cosine_top_k(query_blob, matrix_blob, k, **options)
+      reject_runtime_dim!(options)
+      StaticEmbeddings.cosine_top_k(query_blob, matrix_blob, k, **options.merge(dim: dim))
     end
 
-    def dot_top_k(query_blob, matrix_blob, k, **opts)
-      raise ArgumentError, "dim: is set by the model" if opts.key?(:dim)
-
-      StaticEmbeddings.dot_top_k(query_blob, matrix_blob, k, **opts.merge(dim: dim))
+    def dot_top_k(query_blob, matrix_blob, k, **options)
+      reject_runtime_dim!(options)
+      StaticEmbeddings.dot_top_k(query_blob, matrix_blob, k, **options.merge(dim: dim))
     end
 
     def to_s
@@ -44,5 +46,18 @@ module StaticEmbeddings
     end
 
     alias inspect to_s
+
+    private
+
+    def parse_provenance
+      raw = provenance_json
+      raw.nil? ? {} : JSON.parse(raw)
+    rescue JSON::ParserError, EncodingError => e
+      raise InvalidModelError, "invalid provenance JSON: #{e.message}"
+    end
+
+    def reject_runtime_dim!(options)
+      raise InvalidOptionError, "dim: is set by the model" if options.key?(:dim)
+    end
   end
 end
