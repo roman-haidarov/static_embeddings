@@ -195,7 +195,7 @@ static float cosine_score(float dot, float row_sq, float inv_query_norm) {
 void *se_topk_execute(void *arg) {
     se_topk_job_t *job = (se_topk_job_t *)arg;
     for (size_t r = 0; r < job->rows; r++) {
-        if ((r & 1023u) == 0 && job->cancelled)
+        if ((r & 1023u) == 0 && se_cancel_requested(&job->cancelled))
             return NULL;
         float score;
 

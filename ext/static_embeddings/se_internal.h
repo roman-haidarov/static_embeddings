@@ -3,8 +3,17 @@
 
 #include <stddef.h>
 #include <stdint.h>
-#include <signal.h>
 #include <limits.h>
+
+typedef int se_cancel_flag_t;
+
+static inline int se_cancel_requested(const se_cancel_flag_t *flag) {
+    return flag && __atomic_load_n(flag, __ATOMIC_RELAXED);
+}
+
+static inline void se_cancel_request(se_cancel_flag_t *flag) {
+    __atomic_store_n(flag, 1, __ATOMIC_RELAXED);
+}
 
 #define SE_MAGIC          "SEMBv1\0\0"
 #define SE_MAGIC_LEN      8
@@ -277,7 +286,7 @@ typedef struct {
     float *best_score;
     int cosine;
     float inv_query_norm;
-    volatile sig_atomic_t cancelled;
+    se_cancel_flag_t cancelled;
 } se_topk_job_t;
 
 SE_STATIC_ASSERT(sizeof(se_vocab_slot_t) == 16, vocab_slot_size);
@@ -415,14 +424,14 @@ typedef enum { SE_TOKEN_LIMIT_RAW = 0, SE_TOKEN_LIMIT_USABLE = 1 } se_token_limi
 
 se_status_t se_tokenize(const se_model_t *model, se_scratch_t *scratch, const uint8_t *input,
                         size_t input_len, uint32_t max_tokens, se_token_limit_t limit_mode,
-                        se_token_stats_t *stats, se_error_t *err, volatile sig_atomic_t *cancelled);
+                        se_token_stats_t *stats, se_error_t *err, se_cancel_flag_t *cancelled);
 
 se_status_t se_embed_one(const se_model_t *model, se_scratch_t *scratch, const uint8_t *input,
                          size_t input_len, uint32_t max_tokens, float *out, se_token_stats_t *stats,
-                         se_error_t *err, volatile sig_atomic_t *cancelled);
+                         se_error_t *err, se_cancel_flag_t *cancelled);
 se_status_t se_embed_ids(const se_model_t *model, se_scratch_t *scratch, const uint32_t *ids,
                          size_t n_ids, float *out, se_token_stats_t *stats, se_error_t *err,
-                         volatile sig_atomic_t *cancelled);
+                         se_cancel_flag_t *cancelled);
 
 void se_l2_normalize(float *vec, uint32_t dim);
 size_t se_model_warmup(const se_model_t *model);
