@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.5.7
+
+### Fixed
+
+- Model mappings are no longer closed while embedding, warmup, or token-ID
+  operations are using them without the GVL. `Model#close` raises
+  `StaticEmbeddings::Error` while such an operation is active.
+- Tokenizer code-point writes now verify the capacity invariant after growth.
+- Resolved Clang conversion warnings and formatting issues in the native code.
+
 ## 1.5.6
 
 Multi-source WordPiece release. The native `.semb` v3 runtime is unchanged; new

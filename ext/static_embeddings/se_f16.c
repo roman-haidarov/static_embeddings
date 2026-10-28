@@ -35,7 +35,7 @@ static void write_u16le(uint8_t *dst, uint16_t v) {
 }
 
 static uint16_t read_u16le(const uint8_t *src) {
-    return (uint16_t)src[0] | ((uint16_t)src[1] << 8);
+    return (uint16_t)((uint16_t)src[0] | ((uint16_t)src[1] << 8));
 }
 
 uint16_t se_float_to_f16_bits(float value) {

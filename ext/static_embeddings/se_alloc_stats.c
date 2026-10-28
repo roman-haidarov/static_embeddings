@@ -5,9 +5,8 @@
 #include <string.h>
 
 static const char *const se_alloc_category_names[SE_ALLOC_CATEGORY_COUNT] = {
-    "unknown",    "scratch",     "batch_input",      "batch_output",
-    "batch_stats", "batch_index", "token_ids",       "topk_query",
-    "topk_best",  "topk_matrix_copy", "format_validate", "model_file"};
+    "unknown",   "scratch",    "batch_input", "batch_output",     "batch_stats",     "batch_index",
+    "token_ids", "topk_query", "topk_best",   "topk_matrix_copy", "format_validate", "model_file"};
 
 const char *se_alloc_category_name(se_alloc_category_t category) {
     if ((unsigned)category >= SE_ALLOC_CATEGORY_COUNT)
@@ -176,7 +175,8 @@ void *se_alloc_stats_realloc(se_alloc_category_t category, void *ptr, size_t byt
     if (old_header->h.magic != SE_ALLOC_STATS_MAGIC)
         abort();
 
-    se_alloc_category_t old_category = normalize_category((se_alloc_category_t)old_header->h.category);
+    se_alloc_category_t old_category =
+        normalize_category((se_alloc_category_t)old_header->h.category);
     size_t old_bytes = old_header->h.size;
     se_alloc_header_t *new_header = (se_alloc_header_t *)realloc(old_header, total);
     if (!new_header)
@@ -223,8 +223,7 @@ void se_alloc_stats_snapshot(se_alloc_stats_t out[SE_ALLOC_CATEGORY_COUNT]) {
     for (size_t i = 0; i < SE_ALLOC_CATEGORY_COUNT; i++) {
         out[i].current_bytes = atomic_load_size(&se_alloc_stats[i].current_bytes);
         out[i].peak_bytes = atomic_load_size(&se_alloc_stats[i].peak_bytes);
-        out[i].total_allocated_bytes =
-            atomic_load_size(&se_alloc_stats[i].total_allocated_bytes);
+        out[i].total_allocated_bytes = atomic_load_size(&se_alloc_stats[i].total_allocated_bytes);
         out[i].total_freed_bytes = atomic_load_size(&se_alloc_stats[i].total_freed_bytes);
         out[i].alloc_count = atomic_load_size(&se_alloc_stats[i].alloc_count);
         out[i].realloc_count = atomic_load_size(&se_alloc_stats[i].realloc_count);

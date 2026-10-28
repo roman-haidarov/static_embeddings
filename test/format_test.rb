@@ -269,6 +269,45 @@ class FormatTest < Minitest::Test
     assert_raises(StaticEmbeddings::Error) { model.embed("hello") }
   end
 
+  def test_close_does_not_unmap_a_model_used_by_another_thread
+    model = StaticEmbeddings.load(@path)
+    started = Queue.new
+    result = Queue.new
+    text = "hello world " * 100_000
+    worker = Thread.new do
+      started << true
+      result << [:ok, model.embed(text, max_tokens: false)]
+    rescue StandardError => e
+      result << [:error, e.class, e.message]
+    end
+
+    started.pop
+    Thread.pass
+    close_error = nil
+    begin
+      model.close
+    rescue StaticEmbeddings::Error => e
+      close_error = e
+    end
+
+    worker.join
+    outcome, value, message = result.pop
+    if close_error
+      assert_match(/active operation/, close_error.message)
+      assert_equal :ok, outcome
+      assert_equal model.dim * 4, value.bytesize
+      model.close
+    else
+      assert model.closed?
+      assert_includes %i[ok error], outcome
+      assert_equal StaticEmbeddings::Error, value if outcome == :error
+      assert_equal "model is closed", message if outcome == :error
+    end
+  ensure
+    worker&.join
+    model&.close unless model&.closed?
+  end
+
   private
 
   def read_u32(data, offset)
