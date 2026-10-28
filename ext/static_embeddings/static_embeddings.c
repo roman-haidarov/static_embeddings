@@ -93,6 +93,7 @@ RUBY_FUNC_EXPORTED void Init_static_embeddings(void);
 typedef struct {
     se_model_t model;
     int open;
+    unsigned int active_ops;
 } model_wrapper_t;
 
 static void model_free(void *ptr) {
@@ -177,7 +178,7 @@ static void check_text_encoding_mode(VALUE str, long index, se_encoding_validati
                  rb_enc_name(enc));
     }
 
-    int cr = ENC_CODERANGE(str);
+    int cr = (int)ENC_CODERANGE(str);
     if (cr == ENC_CODERANGE_UNKNOWN) {
         if (mode == SE_VALIDATE_ENCODING_PREFIX)
             return;
@@ -216,6 +217,7 @@ typedef struct {
 
 typedef struct {
     const se_model_t *model;
+    model_wrapper_t *owner;
     batch_input_t input;
     uint32_t max_tokens;
     float *out;
@@ -227,6 +229,8 @@ typedef struct {
     volatile sig_atomic_t cancelled;
     se_error_t error;
 } batch_job_t;
+
+static void run_job(batch_job_t *job, size_t total_bytes);
 
 static void job_fail(batch_job_t *job, se_error_t err, size_t index) {
     if (job->failed)
@@ -361,6 +365,21 @@ static VALUE fiber_worker_ensure(VALUE wrapper) {
     return Qnil;
 }
 
+static VALUE run_job_body(VALUE arg) {
+    batch_job_t *job = (batch_job_t *)(uintptr_t)arg;
+    size_t total_bytes = 0;
+    for (size_t i = 0; i < job->input.count; i++)
+        total_bytes += job->input.lengths[i];
+    run_job(job, total_bytes);
+    return Qnil;
+}
+
+static VALUE run_job_ensure(VALUE arg) {
+    batch_job_t *job = (batch_job_t *)(uintptr_t)arg;
+    job->owner->active_ops--;
+    return Qnil;
+}
+
 static void run_job(batch_job_t *job, size_t total_bytes) {
     VALUE scheduler = current_fiber_scheduler();
 
@@ -386,11 +405,8 @@ static void run_job(batch_job_t *job, size_t total_bytes) {
 
 static VALUE protected_run_job(VALUE arg) {
     batch_job_t *job = (batch_job_t *)(uintptr_t)arg;
-    size_t total_bytes = 0;
-    for (size_t i = 0; i < job->input.count; i++)
-        total_bytes += job->input.lengths[i];
-    run_job(job, total_bytes);
-    return Qnil;
+    job->owner->active_ops++;
+    return rb_ensure(run_job_body, arg, run_job_ensure, arg);
 }
 
 static VALUE model_alloc(VALUE klass) {
@@ -422,6 +438,8 @@ static VALUE model_close(VALUE self) {
     model_wrapper_t *w;
     TypedData_Get_Struct(self, model_wrapper_t, &model_type, w);
     if (w->open) {
+        if (w->active_ops != 0)
+            rb_raise(eError, "model is busy with an active operation");
         se_model_close(&w->model);
         w->open = 0;
     }
@@ -474,18 +492,40 @@ typedef struct {
     size_t pages;
 } warmup_job_t;
 
+typedef struct {
+    VALUE self;
+    model_wrapper_t *owner;
+    warmup_job_t job;
+} warmup_run_t;
+
 static void *warmup_execute(void *arg) {
     warmup_job_t *job = (warmup_job_t *)arg;
     job->pages = se_model_warmup(job->model);
     return NULL;
 }
 
+static VALUE warmup_body(VALUE arg) {
+    warmup_run_t *run = (warmup_run_t *)(uintptr_t)arg;
+    rb_thread_call_without_gvl(warmup_execute, &run->job, NULL, NULL);
+    RB_GC_GUARD(run->self);
+    return Qnil;
+}
+
+static VALUE warmup_ensure(VALUE arg) {
+    warmup_run_t *run = (warmup_run_t *)(uintptr_t)arg;
+    run->owner->active_ops--;
+    return Qnil;
+}
+
 static VALUE model_warmup(VALUE self) {
     model_wrapper_t *w = get_model(self);
-    warmup_job_t job;
-    job.model = &w->model;
-    job.pages = 0;
-    rb_thread_call_without_gvl(warmup_execute, &job, NULL, NULL);
+    warmup_run_t run;
+    run.self = self;
+    run.owner = w;
+    run.job.model = &w->model;
+    run.job.pages = 0;
+    w->active_ops++;
+    rb_ensure(warmup_body, (VALUE)(uintptr_t)&run, warmup_ensure, (VALUE)(uintptr_t)&run);
     RB_GC_GUARD(self);
     return self;
 }
@@ -829,6 +869,7 @@ static VALUE embed_texts_internal(VALUE self, VALUE texts, int is_array, size_t 
         batch_job_t job;
         memset(&job, 0, sizeof(job));
         job.model = model;
+        job.owner = w;
         job.max_tokens = max_tokens;
         job.out = run.out;
         job.stats = run.stats;
@@ -1116,6 +1157,7 @@ typedef struct {
 
 typedef struct {
     VALUE ids_value;
+    model_wrapper_t *owner;
     const se_model_t *model;
     uint32_t max_tokens;
     uint32_t *ids;
@@ -1126,6 +1168,7 @@ typedef struct {
     se_token_stats_t *stats_out;
     se_token_stats_t stats;
     int truncated;
+    int active;
 } ids_run_t;
 
 typedef struct {
@@ -1197,7 +1240,11 @@ static VALUE embed_token_ids_body(VALUE arg) {
     se_error_clear(&job.error);
 
     if (run->n >= SE_IDS_GVL_UNLOCK_THRESHOLD) {
+        run->owner->active_ops++;
+        run->active = 1;
         rb_thread_call_without_gvl(ids_execute, &job, ids_unblock_cancel, &job);
+        run->owner->active_ops--;
+        run->active = 0;
         rb_thread_check_ints();
         if (job.cancelled)
             rb_raise(rb_eInterrupt, "operation cancelled");
@@ -1225,6 +1272,8 @@ static VALUE embed_token_ids_body(VALUE arg) {
 
 static VALUE embed_token_ids_ensure(VALUE arg) {
     ids_run_t *run = (ids_run_t *)(uintptr_t)arg;
+    if (run->active)
+        run->owner->active_ops--;
     se_free(run->ids);
     se_free(run->out);
     run->ids = NULL;
@@ -1280,6 +1329,7 @@ static VALUE embed_token_ids_value(VALUE self, VALUE ids_value, VALUE max_tokens
     ids_run_t run;
     memset(&run, 0, sizeof(run));
     run.ids_value = ids_value;
+    run.owner = w;
     run.model = &w->model;
     run.max_tokens = max_tokens;
     run.n = n;

@@ -73,8 +73,7 @@ float se_dot_product_f32(const float *q, const float *row, size_t dim) {
     return dot;
 }
 
-float se_dot_and_row_sq_f32(const float *q, const float *row, size_t dim,
-                            float *row_sq_out) {
+float se_dot_and_row_sq_f32(const float *q, const float *row, size_t dim, float *row_sq_out) {
     size_t j = 0;
 #if defined(SE_HAVE_NEON)
     float32x4_t d0 = vdupq_n_f32(0.0f);

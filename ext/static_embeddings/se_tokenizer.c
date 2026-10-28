@@ -512,6 +512,8 @@ static int append_segment_cp(token_state_t *st, uint32_t cp) {
         st->segment_ascii = 0;
     if (!grow_u32(&st->scratch->cps, &st->scratch->cps_cap, st->segment_len + 1))
         return 0;
+    if (st->segment_len >= st->scratch->cps_cap)
+        return 0;
     st->scratch->cps[st->segment_len++] = cp;
     return 1;
 }
@@ -905,6 +907,10 @@ static se_status_t tokenize_ascii_run(token_state_t *st, const uint8_t *input, s
                     *ip = i;
                     return oom(st, "building token segment");
                 }
+            }
+            if (st->segment_len >= sc->cps_cap) {
+                *ip = i;
+                return oom(st, "building token segment");
             }
             sc->cps[st->segment_len++] =
                 (lc && b >= 'A' && b <= 'Z') ? (uint32_t)(b + 32u) : (uint32_t)b;
