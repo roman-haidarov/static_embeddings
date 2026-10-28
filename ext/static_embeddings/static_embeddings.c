@@ -9,7 +9,6 @@
 #include <float.h>
 #include <limits.h>
 #include <math.h>
-#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -226,7 +225,7 @@ typedef struct {
     size_t next_index;
     int failed;
     size_t failed_index;
-    volatile sig_atomic_t cancelled;
+    se_cancel_flag_t cancelled;
     se_error_t error;
 } batch_job_t;
 
@@ -244,7 +243,7 @@ static void batch_worker_run(batch_job_t *job, se_scratch_t *scratch) {
     const uint32_t dim = job->model->meta.dim;
 
     for (;;) {
-        if (job->cancelled) {
+        if (se_cancel_requested(&job->cancelled)) {
             se_error_set(&job->error, SE_ERR_INTERNAL, "operation cancelled");
             job->failed = 1;
             return;
@@ -293,7 +292,7 @@ static void *batch_execute(void *arg) {
 static void unblock_cancel(void *arg) {
     batch_job_t *job = (batch_job_t *)arg;
     if (job)
-        job->cancelled = 1;
+        se_cancel_request(&job->cancelled);
 }
 
 static VALUE current_fiber_scheduler(void) {
@@ -358,7 +357,7 @@ static VALUE fiber_worker_ensure(VALUE wrapper) {
     fiber_worker_t *w;
     TypedData_Get_Struct(wrapper, fiber_worker_t, &fiber_worker_type, w);
     if (!NIL_P(w->thread)) {
-        w->job->cancelled = 1;
+        se_cancel_request(&w->job->cancelled);
         rb_funcall(w->thread, id_kill, 0);
         rb_funcall(w->thread, id_join, 0);
     }
@@ -885,7 +884,7 @@ static VALUE embed_texts_internal(VALUE self, VALUE texts, int is_array, size_t 
         int state = 0;
         rb_protect(protected_run_job, (VALUE)(uintptr_t)&job, &state);
         if (state) {
-            job.cancelled = 1;
+            se_cancel_request(&job.cancelled);
             free_input(&job.input);
             embed_run_free(&run);
             rb_jump_tag(state);
@@ -1151,7 +1150,7 @@ typedef struct {
     size_t n_ids;
     float *out;
     se_token_stats_t stats;
-    volatile sig_atomic_t cancelled;
+    se_cancel_flag_t cancelled;
     se_error_t error;
 } ids_job_t;
 
@@ -1200,7 +1199,7 @@ static void *ids_execute(void *arg) {
 static void ids_unblock_cancel(void *arg) {
     ids_job_t *job = (ids_job_t *)arg;
     if (job)
-        job->cancelled = 1;
+        se_cancel_request(&job->cancelled);
 }
 
 static VALUE embed_token_ids_body(VALUE arg) {
@@ -1246,7 +1245,7 @@ static VALUE embed_token_ids_body(VALUE arg) {
         run->owner->active_ops--;
         run->active = 0;
         rb_thread_check_ints();
-        if (job.cancelled)
+        if (se_cancel_requested(&job.cancelled))
             rb_raise(rb_eInterrupt, "operation cancelled");
     } else {
         ids_execute(&job);
@@ -1396,7 +1395,7 @@ static int ptr_is_float_aligned(const void *ptr) {
 static void topk_unblock_cancel(void *arg) {
     se_topk_job_t *job = (se_topk_job_t *)arg;
     if (job)
-        job->cancelled = 1;
+        se_cancel_request(&job->cancelled);
 }
 
 static VALUE topk_body(VALUE arg) {
@@ -1425,7 +1424,7 @@ static VALUE topk_body(VALUE arg) {
         rb_thread_check_ints();
     }
 
-    if (run->job.cancelled)
+    if (se_cancel_requested(&run->job.cancelled))
         rb_raise(rb_eInterrupt, "operation cancelled");
 
     VALUE result = rb_ary_new_capa(run->job.k);

@@ -119,7 +119,7 @@ void se_l2_normalize(float *vec, uint32_t dim) {
 
 static se_status_t embed_ids_core(const se_model_t *model, se_scratch_t *sc, const uint32_t *ids,
                                   size_t n, float *out, se_error_t *err,
-                                  volatile sig_atomic_t *cancelled) {
+                                  se_cancel_flag_t *cancelled) {
     const uint32_t dim = model->meta.dim;
     float *acc = sc->acc;
     memset(acc, 0, (size_t)dim * sizeof(float));
@@ -129,7 +129,7 @@ static se_status_t embed_ids_core(const se_model_t *model, se_scratch_t *sc, con
 
     size_t used = 0;
     for (size_t i = 0; i < n; i++) {
-        if (((i & 255u) == 0) && cancelled && *cancelled) {
+        if (((i & 255u) == 0) && se_cancel_requested(cancelled)) {
             se_error_set(err, SE_ERR_INTERNAL, "operation cancelled");
             return SE_ERR_INTERNAL;
         }
@@ -179,7 +179,7 @@ static se_status_t embed_ids_core(const se_model_t *model, se_scratch_t *sc, con
 
 se_status_t se_embed_ids(const se_model_t *model, se_scratch_t *sc, const uint32_t *ids,
                          size_t n_ids, float *out, se_token_stats_t *stats, se_error_t *err,
-                         volatile sig_atomic_t *cancelled) {
+                         se_cancel_flag_t *cancelled) {
     if (n_ids > UINT32_MAX) {
         se_error_set(err, SE_ERR_OOM, "too many token ids");
         return SE_ERR_OOM;
@@ -196,7 +196,7 @@ se_status_t se_embed_ids(const se_model_t *model, se_scratch_t *sc, const uint32
 
 se_status_t se_embed_one(const se_model_t *model, se_scratch_t *sc, const uint8_t *input,
                          size_t input_len, uint32_t max_tokens, float *out, se_token_stats_t *stats,
-                         se_error_t *err, volatile sig_atomic_t *cancelled) {
+                         se_error_t *err, se_cancel_flag_t *cancelled) {
     se_status_t rc = se_tokenize(model, sc, input, input_len, max_tokens, SE_TOKEN_LIMIT_USABLE,
                                  stats, err, cancelled);
     if (rc != SE_OK)

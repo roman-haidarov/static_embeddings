@@ -495,11 +495,11 @@ typedef struct {
     int segment_ascii;
     se_token_stats_t *stats;
     se_error_t *err;
-    volatile sig_atomic_t *cancelled;
+    se_cancel_flag_t *cancelled;
 } token_state_t;
 
 static int token_cancelled(const token_state_t *st) {
-    return st->cancelled && *st->cancelled;
+    return se_cancel_requested(st->cancelled);
 }
 
 static se_status_t oom(token_state_t *st, const char *where) {
@@ -954,7 +954,7 @@ static se_status_t tokenize_ascii_run(token_state_t *st, const uint8_t *input, s
 se_status_t se_tokenize(const se_model_t *model, se_scratch_t *sc, const uint8_t *input,
                         size_t input_len, uint32_t max_tokens, se_token_limit_t limit_mode,
                         se_token_stats_t *stats, se_error_t *err,
-                        volatile sig_atomic_t *cancelled) {
+                        se_cancel_flag_t *cancelled) {
     memset(stats, 0, sizeof(*stats));
 
     token_state_t st;

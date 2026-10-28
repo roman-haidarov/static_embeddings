@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.5.8
+
+### Fixed
+
+- Cancellation flags shared by Ruby's unblock callback and native worker threads now use
+  atomic loads and stores, removing a C data race during interrupted embedding, tokenization,
+  and top-k operations.
+
 ## 1.5.7
 
 ### Fixed
