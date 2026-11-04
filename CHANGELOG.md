@@ -1,5 +1,64 @@
 # Changelog
 
+## 1.5.9
+
+Pins the upstream contract to **model2vec 0.10.0 / tokenizers 0.23.3** and
+closes a fail-open hole in the converter. The `.semb` format stays v3; files
+written by earlier versions load and embed exactly as before.
+
+### Fixed
+
+- **Model2Vec `weights` were silently ignored.** The importer picked the only 2-D
+  tensor in `model.safetensors` and skipped every 1-D tensor, so a model with
+  per-token `weights` converted without error and produced wrong vectors
+  (cosine 0.71–0.98 against `StaticModel` on the test fixture). Vocabulary-
+  quantized models (`embeddings` K×d + `weights` + `mapping`) failed with a
+  misleading "rows != tokens" error. Both are now baked into ordinary float32
+  rows, `row[i] = embeddings[mapping[i]] * weights[i]`, which is exactly what
+  `StaticModel` pools; the C runtime is unchanged. Weighted, quantized and
+  F64/I64 side-tensor variants match model2vec 0.10.0 within `max_abs 1.2e-7`.
+  Provenance records `baked_token_weights` / `baked_vocabulary_quantization`.
+- **Unknown safetensors tensors are rejected** instead of ignored.
+- **`tools/eval_retrieval.rb` no longer reports trivial metrics as results.**
+  With `k >= documents` Hit@k is 1.0 for every model by construction (the
+  bundled Russian FAQ set has 10 documents and used k=10). The tool now prints
+  full-ranking MRR, nDCG/recall/hit at k, a random-ranking baseline, bootstrap
+  95% intervals over queries, and warnings for trivial `k`, small query sets and
+  zero-vector queries.
+
+### Changed
+
+- **Model2Vec truncation follows 0.10.0 by default.** model2vec 0.10.0 moved
+  truncation into the tokenizer: `max_length` now counts raw ids including
+  `[UNK]`, and `[UNK]` is dropped afterwards. 0.9.0 dropped `[UNK]` first. On a
+  text whose `[UNK]` tokens precede the cap the two versions disagree (cosine
+  0.59 on a synthetic case). New header value `truncation_policy = 3`
+  (`raw_ids`) is the Model2Vec default; `--truncation usable-ids` (`2`) keeps the
+  0.9.0 contract for indexes built with it. Files written before 1.5.9 carry
+  `2` and are unaffected. `Model#truncation` reports `:raw_ids` / `:usable_ids`.
+  Sentence Transformers conversions are unchanged (with `UNK_INCLUDE` both
+  policies select the same ids).
+- **`config.json` `max_length` sets the default token cap**, as in 0.10.0
+  (`null` means unlimited; absent still means 512).
+- Oracle schema 3 (`tools/model2vec_oracle.py`) records the truncation policy
+  and supports both upstream versions; the checker refuses to compare a model
+  against an oracle of the other policy.
+- CI: `upstream_parity` and `potion_audit` pin 0.10.0 / 0.23.3 / numpy 2.5.4; new
+  `upstream_parity_usable_ids` keeps the 0.9.0 contract tested; new
+  non-blocking `upstream_canary` runs the corpus against unpinned PyPI releases
+  so the next upstream drift is reported instead of discovered in production.
+- README "Language safety" no longer presents the `[UNK]` ratio as sufficient:
+  text spelled out letter by letter has almost no `[UNK]` and is just as broken.
+
+### Upgrade notes
+
+Reconverting a Model2Vec source with 1.5.9 changes vectors only for texts with
+`[UNK]` before the token cap. If you keep an existing index, either keep the
+old `.semb` or reconvert with `--truncation usable-ids`; do not mix files of
+both policies in one index. Real-model audits in `docs/MODEL_AUDIT.md` were
+recorded under 0.9.0 and must be re-run (the `potion_audit` CI job does this
+for potion-retrieval-32M).
+
 ## 1.5.8
 
 ### Fixed

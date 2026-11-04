@@ -122,6 +122,61 @@ class ConversionTest < Minitest::Test
     assert_equal 1_000_000, TestSupport.model.provenance["config_seq_length"]
   end
 
+  def with_config(changes)
+    Dir.mktmpdir do |dir|
+      FileUtils.cp_r(Dir[File.join(TestSupport.source_dir, "*")], dir)
+      config_path = File.join(dir, "config.json")
+      config = JSON.parse(File.read(config_path)).merge(changes)
+      File.write(config_path, JSON.generate(config))
+      Dir.mktmpdir do |out|
+        path = File.join(out, "m.semb")
+        StaticEmbeddings.convert(dir, output_path: path)
+        model = StaticEmbeddings.load(path)
+        begin
+          yield model
+        ensure
+          model.close
+        end
+      end
+    end
+  end
+
+  def test_model2vec_config_max_length_is_the_default_cap
+    with_config("max_length" => 64) { |model| assert_equal 64, model.max_tokens }
+  end
+
+  def test_model2vec_config_max_length_null_means_unlimited
+    with_config("max_length" => nil) { |model| assert_equal false, model.max_tokens }
+  end
+
+  def test_model2vec_config_max_length_must_be_positive
+    assert_raises(StaticEmbeddings::InvalidSourceError) { with_config("max_length" => 0) { |_| nil } }
+  end
+
+  def test_model2vec_config_max_length_must_fit_the_file_format
+    max = StaticEmbeddings::Format::UINT32_MAX
+    assert_raises(StaticEmbeddings::InvalidSourceError) { with_config("max_length" => max + 1) { |_| nil } }
+  end
+
+  def test_model2vec_defaults_to_raw_ids_truncation_and_records_reference
+    model = TestSupport.model
+    assert_equal :raw_ids, model.truncation
+    assert_equal "raw_ids", model.provenance["truncation"]
+    assert_equal "0.10.0", model.provenance["reference_model2vec_version"]
+
+    legacy = TestSupport.usable_ids_model
+    assert_equal :usable_ids, legacy.truncation
+    assert_equal "0.9.0", legacy.provenance["reference_model2vec_version"]
+  end
+
+  def test_unknown_truncation_policy_is_rejected
+    Dir.mktmpdir do |out|
+      assert_raises(StaticEmbeddings::InvalidOptionError) do
+        StaticEmbeddings.convert(TestSupport.source_dir, output_path: File.join(out, "m.semb"), truncation: :chars)
+      end
+    end
+  end
+
   def test_model2vec_missing_normalize_defaults_to_none
     Dir.mktmpdir do |dir|
       FileUtils.cp_r(Dir[File.join(TestSupport.source_dir, "*")], dir)

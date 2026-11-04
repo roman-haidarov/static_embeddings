@@ -54,7 +54,7 @@ module StaticEmbeddings
     end
 
     def convert(source_dir, output_path:, model_id: nil, max_tokens: nil, dimensions: nil,
-                source_revision: nil, trained_mrl_dims: nil)
+                source_revision: nil, trained_mrl_dims: nil, truncation: nil)
       require "static_embeddings/conversion"
       Conversion.call(
         source_dir,
@@ -63,7 +63,8 @@ module StaticEmbeddings
         max_tokens: max_tokens,
         dimensions: dimensions,
         source_revision: source_revision,
-        trained_mrl_dims: trained_mrl_dims
+        trained_mrl_dims: trained_mrl_dims,
+        truncation: truncation
       )
     end
 

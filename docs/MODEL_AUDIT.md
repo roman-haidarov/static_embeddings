@@ -229,3 +229,44 @@ arm64-darwin24, 1.5.6):
 Hit@10 was 1.0 for every model on this tiny labeled set. That is a domain sanity
 check, not a public retrieval benchmark, and it does not make the similarity
 model a hard-coded Russian default.
+
+## 1.5.9 record: model2vec 0.10.0 contract
+
+Recorded locally (x86_64-linux, Ruby 3.2.3, Python 3.12.3), deterministic
+`tiny-wordpiece` fixture, 434-row corpus from `tools/parity_cases.py`, oracle
+schema 3.
+
+`model2vec 0.10.0` / `tokenizers 0.23.3` / `numpy 2.5.4`, default conversion
+(`truncation=raw_ids`):
+
+```text
+rows=434
+vectors_checked=432
+intentional_character_pretruncate_deviations=2
+min_cosine=0.9999999999999982
+max_abs_all=1.1920928955078125e-07
+raw_token_id_failures=[] usable_token_id_failures=[] embed_invariant_failures=[] vector_failures=[]
+corpus parity OK (434/434)
+```
+
+`model2vec 0.9.0` / `tokenizers 0.23.3`, `--truncation usable-ids`
+(`--allow-version-mismatch`, since the oracle now pins 0.10.0):
+
+```text
+rows=434 vectors_checked=429 intentional_character_pretruncate_deviations=5
+min_cosine=0.9999999999999988 max_abs_all=5.960464477539063e-08
+corpus parity OK (434/434)
+```
+
+Negative control: the same `usable_ids` file against the 0.10.0 oracle, with the
+checker's policy guard disabled, fails on rows 426–429 and 432, so the corpus
+does detect the truncation-order change.
+
+Side tensors (`weights`, `weights + mapping` from `quantize_model(...,
+vocabulary_quantization=32)`, and an F64/I64 variant) on the same fixture:
+`max_abs` 6.0e-8, 6.0e-8 and 1.2e-7 against `StaticModel.encode`.
+
+**Not yet re-run under 0.10.0:** potion-retrieval-32M, potion-base-8M,
+potion-science-32M. Their records above are 0.9.0 / `usable_ids` results. The
+`potion_audit` CI job regenerates the potion-retrieval-32M record; append it
+here before trusting a 1.5.9 conversion of that model.

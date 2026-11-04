@@ -20,9 +20,15 @@ end
 
 model = StaticEmbeddings.load(options[:model], verify: true)
 payload = JSON.parse(File.read(options[:oracle], encoding: "UTF-8"))
-abort "unsupported oracle schema #{payload["schema_version"].inspect}" unless payload["schema_version"] == 2
+schema = payload["schema_version"]
+abort "unsupported oracle schema #{schema.inspect}" unless [2, 3].include?(schema)
 
 reference = payload.fetch("reference")
+oracle_truncation = (reference["truncation"] || "usable_ids").to_sym
+if oracle_truncation != model.truncation
+  abort "oracle truncation=#{oracle_truncation} (model2vec #{reference['model2vec']}) " \
+        "but model.truncation=#{model.truncation}; reconvert with --truncation #{oracle_truncation.to_s.tr('_', '-')}"
+end
 max_length = Integer(reference.fetch("max_length"))
 if max_length != model.max_tokens
   abort "oracle max_length=#{max_length} but model.max_tokens=#{model.max_tokens}"
@@ -79,16 +85,17 @@ rows.each_with_index do |row, i|
   end
 
   full_raw = model.tokenize(text, max_tokens: false)
-  expected_usable = row.fetch("static_usable_token_ids")
-  got_usable = if reference["unk_token_id"].nil?
-                 full_raw.first(max_length)
+  expected_usable = row["static_pooled_token_ids"] || row.fetch("static_usable_token_ids")
+  drop_unk = ->(ids) { reference["unk_token_id"].nil? ? ids : ids.reject { |id| id == model.unk_id } }
+  got_usable = if model.truncation == :raw_ids
+                 drop_unk.call(full_raw.first(max_length))
                else
-                 full_raw.reject { |id| id == model.unk_id }.first(max_length)
+                 drop_unk.call(full_raw).first(max_length)
                end
   if got_usable != expected_usable
     usable_failures << i
     first = got_usable.zip(expected_usable).index { |a, b| a != b } || [got_usable.length, expected_usable.length].min
-    problems << "usable ids differ at #{first} (got #{got_usable.length}, ref #{expected_usable.length})"
+    problems << "pooled ids differ at #{first} (got #{got_usable.length}, ref #{expected_usable.length})"
   end
 
   got_vector_blob = model.embed(text)

@@ -12,6 +12,11 @@ module StaticEmbeddings
     NORMALIZATION_NONE = 0
     NORMALIZATION_L2 = 1
     TRUNCATE_USABLE_IDS_BEFORE_POOLING = 2
+    TRUNCATE_RAW_IDS_BEFORE_UNK_DROP = 3
+    TRUNCATION_POLICIES = {
+      raw_ids: TRUNCATE_RAW_IDS_BEFORE_UNK_DROP,
+      usable_ids: TRUNCATE_USABLE_IDS_BEFORE_POOLING
+    }.freeze
     UNK_INCLUDE = 0
     UNK_DROP = 1
     EMPTY_ZERO_VECTOR = 0
@@ -53,7 +58,6 @@ module StaticEmbeddings
       28 => TOKENIZER_BERT_WORDPIECE_V1,
       32 => DTYPE_F32,
       36 => POOLING_MEAN,
-      48 => TRUNCATE_USABLE_IDS_BEFORE_POOLING,
       108 => HASH_SEED
     }.freeze
 
@@ -61,6 +65,7 @@ module StaticEmbeddings
       20 => :dim,
       40 => :normalization_type,
       44 => :max_tokens_default,
+      48 => :truncation_policy,
       56 => :unk_policy,
       60 => :empty_policy,
       80 => :max_input_chars_per_word,

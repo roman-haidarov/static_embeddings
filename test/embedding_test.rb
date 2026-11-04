@@ -219,32 +219,76 @@ class EmbeddingTest < Minitest::Test
     refute results.any? { |(_, score)| score.nan? }, "a NaN row leaked into the top-k"
   end
 
-  def test_unk_is_filtered_before_the_usable_token_cap
-    known = @model.tokenize("hello", max_tokens: false).fetch(0)
-    unk = @model.unk_id
+  def test_usable_ids_policy_filters_unk_before_the_cap
+    model = TestSupport.usable_ids_model
+    assert_equal :usable_ids, model.truncation
+    known = model.tokenize("hello", max_tokens: false).fetch(0)
+    unk = model.unk_id
     ids = [known, unk, known, unk, known, unk, known, unk, known]
 
-    expected = @model.embed_token_ids([known, known, known, known], max_tokens: false)
-    assert_equal expected, @model.embed_token_ids(ids, max_tokens: 4)
+    expected = model.embed_token_ids([known, known, known, known], max_tokens: false)
+    assert_equal expected, model.embed_token_ids(ids, max_tokens: 4)
 
-    stats = @model.embed_token_ids_with_stats(ids, max_tokens: 4)
+    stats = model.embed_token_ids_with_stats(ids, max_tokens: 4)
     assert_equal 7, stats.fetch(:token_count)
     assert_equal 3, stats.fetch(:unk_count)
     assert_equal 4, stats.fetch(:pooled_count)
     assert stats.fetch(:truncated)
   end
 
-  def test_text_embedding_scans_past_unk_to_fill_the_usable_cap
+  def test_usable_ids_policy_scans_past_unk_to_fill_the_cap
+    model = TestSupport.usable_ids_model
     text = "hello [UNK] hello [UNK] hello [UNK] hello [UNK] world"
-    raw = @model.tokenize(text, max_tokens: false)
+    raw = model.tokenize(text, max_tokens: false)
 
-    assert_includes raw, @model.unk_id
-    assert_equal @model.embed_token_ids(raw, max_tokens: 4), @model.embed(text, max_tokens: 4)
+    assert_includes raw, model.unk_id
+    assert_equal model.embed_token_ids(raw, max_tokens: 4), model.embed(text, max_tokens: 4)
 
-    stats = @model.embed_with_stats(text, max_tokens: 4)
+    stats = model.embed_with_stats(text, max_tokens: 4)
     assert_equal 4, stats.fetch(:pooled_count)
     assert_operator stats.fetch(:token_count), :>, 4
     assert stats.fetch(:truncated)
+  end
+
+  def test_raw_ids_policy_counts_unk_against_the_cap
+    assert_equal :raw_ids, @model.truncation
+    known = @model.tokenize("hello", max_tokens: false).fetch(0)
+    unk = @model.unk_id
+    ids = [known, unk, known, unk, known, unk, known, unk, known]
+
+    expected = @model.embed_token_ids([known, known], max_tokens: false)
+    assert_equal expected, @model.embed_token_ids(ids, max_tokens: 4)
+
+    stats = @model.embed_token_ids_with_stats(ids, max_tokens: 4)
+    assert_equal 4, stats.fetch(:token_count)
+    assert_equal 2, stats.fetch(:unk_count)
+    assert_equal 2, stats.fetch(:pooled_count)
+    assert stats.fetch(:truncated)
+  end
+
+  def test_raw_ids_policy_text_path_matches_token_id_path
+    text = "hello [UNK] hello [UNK] hello [UNK] hello [UNK] world"
+    raw = @model.tokenize(text, max_tokens: false)
+    assert_equal @model.embed_token_ids(raw, max_tokens: 4), @model.embed(text, max_tokens: 4)
+    assert_equal @model.embed_token_ids(raw.first(4), max_tokens: false), @model.embed(text, max_tokens: 4)
+
+    stats = @model.embed_with_stats(text, max_tokens: 4)
+    assert_equal 4, stats.fetch(:token_count)
+    assert_equal 2, stats.fetch(:pooled_count)
+    assert stats.fetch(:truncated)
+  end
+
+  def test_both_policies_match_their_reference_twin
+    texts = ["hello [UNK] world " * 300, "привет мир " * 400, "\uE000 hello " * 600]
+    usable_ref = StaticEmbeddings::Reference.from_source_dir(TestSupport.source_dir, truncation: :usable_ids)
+    texts.each do |text|
+      assert_vectors_close TestSupport.reference.embed(text), @model.embed_array(text)
+      assert_vectors_close usable_ref.embed(text), TestSupport.usable_ids_model.embed_array(text)
+    end
+  end
+
+  def assert_vectors_close(expected, actual)
+    expected.zip(actual).each { |e, a| assert_in_delta e, a, 1e-5 }
   end
 
   def test_embed_token_ids_debug_path

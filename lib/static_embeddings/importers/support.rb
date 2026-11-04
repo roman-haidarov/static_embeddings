@@ -4,6 +4,7 @@ require "static_embeddings/errors"
 require "static_embeddings/format/constants"
 require "static_embeddings/safetensors"
 require "static_embeddings/row_prefix_payload"
+require "static_embeddings/weighted_payload"
 
 module StaticEmbeddings
   module Importers
@@ -35,20 +36,65 @@ module StaticEmbeddings
         end
       end
 
-      def extract_matrix(path, vocab_size)
+      MODEL2VEC_SIDE_TENSORS = %w[weights mapping].freeze
+
+      def extract_matrix(path, vocab_size, side_tensors: [])
         raise InvalidSourceError, "missing model.safetensors in #{File.dirname(path)}" unless File.file?(path)
 
-        name, tensor = sole_matrix_tensor(Safetensors.describe(path).fetch(:tensors))
+        tensors = Safetensors.describe(path).fetch(:tensors)
+        name, tensor = sole_matrix_tensor(tensors)
+        reject_unknown_tensors(tensors, name, side_tensors)
         rows, dim = tensor.fetch(:shape)
-        unless rows == vocab_size
-          raise ConversionError,
-                "embedding matrix #{name} has #{rows} rows but the tokenizer has #{vocab_size} tokens"
-        end
         unless dim.positive? && dim <= Format::UINT32_MAX
           raise ConversionError, "embedding matrix #{name} has unsupported dimension #{dim}"
         end
 
-        [Safetensors.f32_payload(path, tensor), dim]
+        payload = Safetensors.f32_payload(path, tensor)
+        weights = side_vector(path, tensors, "weights", vocab_size, side_tensors)
+        mapping = side_vector(path, tensors, "mapping", vocab_size, side_tensors)
+
+        if mapping
+          validate_mapping(mapping, rows)
+        elsif rows != vocab_size
+          raise ConversionError,
+                "embedding matrix #{name} has #{rows} rows but the tokenizer has #{vocab_size} tokens"
+        end
+        validate_weights(weights) if weights
+
+        if weights || mapping
+          payload = WeightedPayload.new(payload, dim: dim, source_rows: rows, output_rows: vocab_size,
+                                                 weights: weights, mapping: mapping)
+        end
+        [payload, dim, { weights: !weights.nil?, mapping_clusters: mapping ? rows : nil }]
+      end
+
+      def reject_unknown_tensors(tensors, matrix_name, side_tensors)
+        unknown = tensors.keys - [matrix_name] - side_tensors
+        return if unknown.empty?
+
+        raise ConversionError,
+              "model.safetensors contains tensors this converter does not understand: #{unknown.inspect}; " \
+              "refusing to ignore them because that would silently change vectors"
+      end
+
+      def side_vector(path, tensors, key, vocab_size, side_tensors)
+        return nil unless side_tensors.include?(key) && tensors.key?(key)
+
+        tensor = tensors.fetch(key)
+        unless tensor.fetch(:shape) == [vocab_size]
+          raise ConversionError, "#{key} tensor has shape #{tensor[:shape].inspect}, expected [#{vocab_size}]"
+        end
+        Safetensors.read_vector(path, tensor)
+      end
+
+      def validate_mapping(mapping, rows)
+        unless mapping.all? { |v| v.is_a?(Integer) && v >= 0 && v < rows }
+          raise ConversionError, "mapping tensor must contain integer row indices in 0...#{rows}"
+        end
+      end
+
+      def validate_weights(weights)
+        raise ConversionError, "weights tensor contains non-finite values" unless weights.all? { |w| w.to_f.finite? }
       end
 
       def resolve_max_tokens(requested, default)
@@ -60,6 +106,14 @@ module StaticEmbeddings
           raise InvalidOptionError, "max_tokens must be 1..#{Format::UINT32_MAX}, false, or :unlimited"
         end
         value
+      end
+
+      def resolve_truncation(requested, default)
+        key = (requested || default).to_s.tr("-", "_").to_sym
+        Format::TRUNCATION_POLICIES.fetch(key) do
+          raise InvalidOptionError,
+                "truncation must be one of #{Format::TRUNCATION_POLICIES.keys.inspect}, got #{requested.inspect}"
+        end
       end
 
       def resolve_dimensions(requested, native_dim)

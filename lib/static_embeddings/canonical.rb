@@ -2,9 +2,9 @@ module StaticEmbeddings
   module Canonical
     Dimensions = Struct.new(:native, :output, :trained, keyword_init: true)
     Runtime = Struct.new(:normalization, :unk_policy, :empty_policy, :max_tokens, :add_special_tokens,
-                         keyword_init: true)
+                         :truncation, keyword_init: true)
     Source = Struct.new(:family, :model, :revision, :oracle, :files_sha256, :tokenizer_class,
-                        :config_seq_length, keyword_init: true)
+                        :config_seq_length, :baked, keyword_init: true)
     Model = Struct.new(:tokens, :matrix, :dimensions, :runtime, :tokenizer, :source, keyword_init: true)
 
     module_function
@@ -13,18 +13,20 @@ module StaticEmbeddings
       Dimensions.new(native: native, output: output, trained: trained&.freeze).freeze
     end
 
-    def runtime(normalization:, unk_policy:, empty_policy:, max_tokens:, add_special_tokens: false)
+    def runtime(normalization:, unk_policy:, empty_policy:, max_tokens:, add_special_tokens: false,
+                truncation: Format::TRUNCATE_USABLE_IDS_BEFORE_POOLING)
       Runtime.new(
         normalization: normalization,
         unk_policy: unk_policy,
         empty_policy: empty_policy,
         max_tokens: max_tokens,
-        add_special_tokens: add_special_tokens
+        add_special_tokens: add_special_tokens,
+        truncation: truncation
       ).freeze
     end
 
     def source(family:, model:, oracle:, files_sha256:, revision: nil, tokenizer_class: nil,
-               config_seq_length: nil)
+               config_seq_length: nil, baked: nil)
       Source.new(
         family: family,
         model: model,
@@ -32,7 +34,8 @@ module StaticEmbeddings
         oracle: oracle,
         files_sha256: files_sha256.freeze,
         tokenizer_class: tokenizer_class,
-        config_seq_length: config_seq_length
+        config_seq_length: config_seq_length,
+        baked: baked&.freeze
       ).freeze
     end
 

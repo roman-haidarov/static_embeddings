@@ -23,6 +23,14 @@ the entry says whether that is a decision or just unfinished work.
   context; a word contributes the same row wherever it appears. If you need
   contextual embeddings, this is the wrong tool.
 
+- **Two upstream truncation contracts, chosen at convert time.** `.semb` files
+  record `raw_ids` (model2vec 0.10.0) or `usable_ids` (0.9.0); there is no
+  runtime switch, because mixing them inside one index silently changes
+  vectors. Model2Vec's character pre-cut is reproduced by neither.
+- **Model2Vec `weights`/`mapping` are expanded, not stored.** A
+  vocabulary-quantized source becomes a full-vocabulary `.semb`; the file does
+  not get smaller. int8 embedding tensors are rejected.
+
 ## Runtime
 
 - **No internal parallelism.** `threads:` is rejected rather than ignored. Split

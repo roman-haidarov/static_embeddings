@@ -695,7 +695,8 @@ static se_status_t validate(se_model_t *model, se_error_t *err) {
                      m->normalization_type);
         return SE_ERR_INVALID_FORMAT;
     }
-    if (m->truncation_policy != SE_TRUNCATE_USABLE_IDS_BEFORE_POOLING) {
+    if (m->truncation_policy != SE_TRUNCATE_USABLE_IDS_BEFORE_POOLING &&
+        m->truncation_policy != SE_TRUNCATE_RAW_IDS_BEFORE_UNK_DROP) {
         se_error_set(err, SE_ERR_INVALID_FORMAT, "truncation policy %u is not supported",
                      m->truncation_policy);
         return SE_ERR_INVALID_FORMAT;
