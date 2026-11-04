@@ -26,6 +26,9 @@ module StaticEmbeddings
           --max-tokens N      Model2Vec default: 512; Sentence Transformers default: unlimited
           --max-tokens unlimited
           --dimensions N      Keep the first N dims (Matryoshka prefix slice)
+          --truncation raw-ids|usable-ids
+                              Model2Vec default raw-ids (model2vec 0.10.0);
+                              usable-ids reproduces model2vec 0.9.0
           --revision SHA      Source revision recorded in provenance
           --trained-mrl-dims  1024,512,256,... training dims recorded in provenance
 
@@ -85,12 +88,13 @@ module StaticEmbeddings
           parser.on("--dimensions N", Integer) { |value| options[:dimensions] = value }
           parser.on("--revision SHA") { |value| options[:source_revision] = value }
           parser.on("--trained-mrl-dims LIST") { |value| options[:trained_mrl_dims] = value }
+          parser.on("--truncation POLICY", %w[raw-ids usable-ids]) { |value| options[:truncation] = value }
         end.parse!(argv)
       end
     end
 
     def conversion_options(options)
-      options.select { |key, _| %i[max_tokens dimensions source_revision trained_mrl_dims].include?(key) }
+      options.select { |key, _| %i[max_tokens dimensions source_revision trained_mrl_dims truncation].include?(key) }
     end
 
     def parse_max_tokens(value)
@@ -111,6 +115,7 @@ module StaticEmbeddings
         "  bytes      #{report[:bytes]}",
         "  sha256     #{report[:sha256]}",
         "  max_tokens #{max_tokens}",
+        "  truncation #{report[:truncation]}",
         "",
         "Record this conversion in docs/MODEL_AUDIT.md before trusting the vectors."
       ].join("\n")
@@ -143,6 +148,7 @@ module StaticEmbeddings
         "dim" => model.dim,
         "vocab_size" => model.vocab_size,
         "max_tokens" => model.max_tokens,
+        "truncation" => model.truncation,
         "normalized" => model.normalized?,
         "lowercase" => model.lowercase?,
         "unk_id" => model.unk_id,

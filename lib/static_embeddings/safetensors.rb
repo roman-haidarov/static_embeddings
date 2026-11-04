@@ -4,6 +4,8 @@ module StaticEmbeddings
   module Safetensors
     MAX_HEADER_BYTES = 100 * 1024 * 1024
     SUPPORTED_DTYPES = { "F32" => 4, "F16" => 2, "BF16" => 2 }.freeze
+    AUX_DTYPES = { "F64" => 8, "I64" => 8, "I32" => 4 }.freeze
+    ELEMENT_SIZES = SUPPORTED_DTYPES.merge(AUX_DTYPES).freeze
     CONVERT_CHUNK_ELEMENTS = 64 * 1024
     IO_CHUNK_BYTES = 1024 * 1024
 
@@ -96,7 +98,33 @@ module StaticEmbeddings
     end
 
     def f32_payload(path, tensor)
+      unless SUPPORTED_DTYPES.key?(tensor.fetch(:dtype))
+        raise ConversionError,
+              "embedding matrix dtype #{tensor.fetch(:dtype)} is not supported (expected F32, F16, or BF16)"
+      end
       F32Payload.new(path, tensor)
+    end
+
+    def read_vector(path, tensor)
+      bytes = File.open(path, "rb") do |io|
+        io.seek(tensor.fetch(:absolute_offset), IO::SEEK_SET)
+        io.read(tensor.fetch(:source_bytes))
+      end
+      unless bytes&.bytesize == tensor.fetch(:source_bytes)
+        raise ConversionError, "tensor data is truncated while reading #{path}"
+      end
+      bytes.force_encoding(Encoding::BINARY)
+
+      case tensor.fetch(:dtype)
+      when "F32" then bytes.unpack("e*")
+      when "F64" then bytes.unpack("E*")
+      when "F16" then convert_f16_to_f32(bytes).unpack("e*")
+      when "BF16" then convert_bf16_to_f32(bytes).unpack("e*")
+      when "I64" then bytes.unpack("q<*")
+      when "I32" then bytes.unpack("l<*")
+      else
+        raise ConversionError, "tensor dtype #{tensor[:dtype]} is not supported"
+      end
     end
 
     def write(path, name, shape, floats)
@@ -171,9 +199,10 @@ module StaticEmbeddings
     end
 
     def checked_tensor_bytes(name, dtype, shape)
-      element_size = SUPPORTED_DTYPES[dtype]
+      element_size = ELEMENT_SIZES[dtype]
       unless element_size
-        raise ConversionError, "tensor #{name}: dtype #{dtype} is not supported (expected F32, F16, or BF16)"
+        raise ConversionError,
+              "tensor #{name}: dtype #{dtype} is not supported (expected #{ELEMENT_SIZES.keys.join(', ')})"
       end
       unless shape.is_a?(Array) && shape.all? { |dim| dim.is_a?(Integer) && dim >= 0 }
         raise ConversionError, "tensor #{name}: malformed shape #{shape.inspect}"

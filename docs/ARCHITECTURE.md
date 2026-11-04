@@ -89,7 +89,7 @@ already has a slot for I8; there is no dead I8 path in C.
 ### Why the semantics live in the header
 
 `max_tokens_default`, `unk_policy`, `empty_policy` and the normalizer flags
-are properties of the *model*, not options the caller guesses. The embedding contract caps the first 512 usable token ids by default;
+are properties of the *model*, not options the caller guesses. So is `truncation_policy`: `3` caps raw ids and then drops `[UNK]` (model2vec 0.10.0, the default for new Model2Vec conversions), `2` drops `[UNK]` first and caps the rest (model2vec 0.9.0, every file written before 1.5.9). The embedding contract caps the first 512 token ids by default;
 a model card's `model_max_length` of 1,000,000 is a different number entirely, and
 confusing them silently changes every vector for long chunks. Model2Vec 0.9.0
 also applies a character pre-cut before tokenization; this runtime intentionally
@@ -159,7 +159,7 @@ picked the wrong one would produce plausible, slightly wrong vectors forever.
 The Ruby build that generated the tables is stamped into provenance, so a
 model file and its embedded normalizer tables can never drift apart unnoticed.
 That stamp is not, by itself, proof of Hugging Face parity: 0.1.5 therefore
-checks a systematic boundary corpus against pinned `tokenizers 0.23.1` in CI.
+checks a systematic boundary corpus against pinned `tokenizers` (0.23.3 since 1.5.9) in CI.
 One subtle example is `Cn`: `bert.rs` says `is_other()` includes unassigned
 codepoints, while the `unicode_categories 0.1.1` implementation actually tests
 Cc/Cf/Co. The runtime follows the executable upstream behavior, not the comment.
@@ -168,9 +168,10 @@ Cc/Cf/Co. The runtime follows the executable upstream behavior, not the comment.
 
 ```
 tokenize -> raw ids (including [UNK])
-drop [UNK] if unk_policy = DROP
-truncate usable ids to max_tokens
-acc[j] += row[j] for each usable id, in token order
+policy 3 (raw_ids):    keep the first max_tokens raw ids, then drop [UNK]*
+policy 2 (usable_ids): drop [UNK]* first, then keep the first max_tokens ids
+                       (* only when unk_policy = DROP; both coincide otherwise)
+acc[j] += row[j] for each kept id, in token order
 divide by the number of pooled rows
 L2 normalize if the model says so
 ```
@@ -226,10 +227,11 @@ therefore serialised the process on work that the tokenizer would discard after
 `embed` and `embed_batch` instead copy a leading slice. The budget starts at
 `max_tokens * 16` bytes clamped to `[4096, 65536]`, and the slice is cut at a
 position where the tokenizer would have started a fresh word. A result is accepted only when that slice actually reached `max_tokens`
-usable ids; `[UNK]` does not consume the embedding budget. Otherwise the budget
-doubles and the text is tokenized again. Growth is geometric. OOV-heavy input
-may therefore reach the full document: deciding that fewer than `max_tokens`
-usable ids exist requires reading it.
+ids as counted by the truncation policy. Under `usable_ids`, `[UNK]` does not
+consume the embedding budget, so OOV-heavy input may reach the full document:
+deciding that fewer than `max_tokens` usable ids exist requires reading it.
+Under `raw_ids` every id counts and the window stays bounded. Otherwise the
+budget doubles and the text is tokenized again. Growth is geometric.
 
 Three properties make this exact rather than approximate:
 

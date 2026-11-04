@@ -463,6 +463,12 @@ static VALUE model_max_tokens(VALUE self) {
     return UINT2NUM(get_model(self)->model.meta.max_tokens_default);
 }
 
+static VALUE model_truncation(VALUE self) {
+    return se_embed_limit_mode(&get_model(self)->model) == SE_TOKEN_LIMIT_RAW
+               ? ID2SYM(rb_intern("raw_ids"))
+               : ID2SYM(rb_intern("usable_ids"));
+}
+
 static VALUE model_normalized_p(VALUE self) {
     return get_model(self)->model.meta.normalization_type == SE_NORMALIZATION_L2 ? Qtrue : Qfalse;
 }
@@ -1290,7 +1296,8 @@ static VALUE embed_token_ids_value(VALUE self, VALUE ids_value, VALUE max_tokens
     size_t n = (size_t)n_long;
     int truncated = 0;
 
-    if (max_tokens != 0 && w->model.meta.unk_policy == SE_UNK_DROP) {
+    if (max_tokens != 0 && w->model.meta.unk_policy == SE_UNK_DROP &&
+        se_embed_limit_mode(&w->model) == SE_TOKEN_LIMIT_USABLE) {
         size_t usable = 0;
         size_t cutoff = n;
         for (size_t i = 0; i < n; i++) {
@@ -1710,6 +1717,7 @@ RUBY_FUNC_EXPORTED void Init_static_embeddings(void) {
     rb_define_method(cModel, "dim", model_dim, 0);
     rb_define_method(cModel, "vocab_size", model_vocab_size, 0);
     rb_define_method(cModel, "max_tokens", model_max_tokens, 0);
+    rb_define_method(cModel, "truncation", model_truncation, 0);
     rb_define_method(cModel, "normalized?", model_normalized_p, 0);
     rb_define_method(cModel, "lowercase?", model_lowercase_p, 0);
     rb_define_method(cModel, "unk_id", model_unk_id, 0);

@@ -25,6 +25,7 @@ module StaticEmbeddings
         dim: model.dimensions.output,
         native_dim: model.dimensions.native,
         max_tokens: model.runtime.max_tokens,
+        truncation: Format::TRUNCATION_POLICIES.key(model.runtime.truncation),
         provenance: JSON.parse(provenance)
       )
     end
@@ -36,6 +37,7 @@ module StaticEmbeddings
         dim: model.dimensions.output,
         normalization_type: runtime.normalization,
         max_tokens_default: runtime.max_tokens,
+        truncation_policy: runtime.truncation,
         add_special_tokens: runtime.add_special_tokens,
         unk_policy: runtime.unk_policy,
         empty_policy: runtime.empty_policy,

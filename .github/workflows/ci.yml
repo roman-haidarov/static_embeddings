@@ -198,7 +198,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: install pinned oracle dependencies
-        run: python -m pip install "model2vec==0.9.0" "tokenizers==0.23.1" "numpy==2.5.2"
+        run: python -m pip install "model2vec==0.10.0" "tokenizers==0.23.3" "numpy==2.5.4"
       - run: bundle exec rake compile
       - name: build deterministic source fixture and .semb
         run: |
@@ -225,7 +225,7 @@ jobs:
           # numpy 2.5.2 (the version recorded in the 0.1.4 potion audit) requires >=3.12
           python-version: "3.12"
       - name: install pinned oracle dependencies
-        run: python -m pip install "model2vec==0.9.0" "tokenizers==0.23.1" "numpy==2.5.2" huggingface_hub
+        run: python -m pip install "model2vec==0.10.0" "tokenizers==0.23.3" "numpy==2.5.4" huggingface_hub
       - uses: actions/cache@v4
         with:
           path: ~/.cache/huggingface/hub

@@ -11,7 +11,7 @@ module StaticEmbeddings
       module_function
 
       def call(root, model_id: nil, max_tokens: nil, dimensions: nil,
-               source_revision: nil, trained_mrl_dims: nil)
+               source_revision: nil, trained_mrl_dims: nil, truncation: nil)
         module_dir = module_directory(root)
         tokenizer = Support.load_object(File.join(module_dir, "tokenizer.json"))
         tokenizer_config = Support.load_object(File.join(module_dir, "tokenizer_config.json"), optional: true) || {}
@@ -32,7 +32,8 @@ module StaticEmbeddings
             normalization: Format::NORMALIZATION_NONE,
             unk_policy: Format::UNK_INCLUDE,
             empty_policy: Format::EMPTY_ZERO_VECTOR,
-            max_tokens: Support.resolve_max_tokens(max_tokens, DEFAULT_MAX_TOKENS)
+            max_tokens: Support.resolve_max_tokens(max_tokens, DEFAULT_MAX_TOKENS),
+            truncation: Support.resolve_truncation(truncation, :usable_ids)
           ),
           tokenizer: BertWordPiece.runtime_meta(profile, tokens),
           source: Canonical.source(

@@ -33,7 +33,7 @@ BERT WordPiece tokenizer profile, an mmap-ready vocabulary lookup, float32
 embedding rows, and provenance plus a checksum.
 
 The only supported tokenizer profile is `BERT_WORDPIECE_V1`, pinned for
-compatibility to `tokenizers 0.23.1`. The converter rejects unsupported
+compatibility to `tokenizers 0.23.3`. The converter rejects unsupported
 tokenizer features rather than approximating them. `.semb` format v3 also
 records which of the five standard BERT added tokens are active. Files produced
 by 0.1.4 and earlier use format v2 and must be reconverted.
@@ -59,6 +59,20 @@ bundle exec ruby -Ilib exe/static_embeddings convert ./static-retrieval-mrl-en-v
   --dimensions 512 \
   --trained-mrl-dims 1024,512,256,128,64,32
 ```
+
+Model2Vec conversions follow the pinned `model2vec 0.10.0` contract by default:
+the token cap counts raw tokenizer ids (with `[UNK]`), then `[UNK]` is dropped.
+An index built with model2vec 0.9.0, or with this gem before 1.5.9, used the
+opposite order; keep it consistent with `--truncation usable-ids`. The policy is
+recorded in the file (`model.truncation` is `:raw_ids` or `:usable_ids`), so old
+`.semb` files keep their behaviour without reconversion. A `max_length` in the
+source `config.json` (0.10.0 writes it; `null` means unlimited) becomes the
+default `max_tokens`.
+
+Model2Vec side tensors are baked into the rows at convert time: per-token
+`weights` and the vocabulary-quantization `mapping` produce
+`row[i] = embeddings[mapping[i]] * weights[i]`, exactly what `StaticModel`
+pools. Any other tensor in `model.safetensors` is rejected rather than ignored.
 
 `--max-tokens unlimited` bakes no token cap (Sentence Transformers default).
 `--max-tokens 0` is a convert-time alias; `embed(max_tokens: 0)` is still
@@ -139,18 +153,20 @@ Output is a binary `String` of little-endian float32 values in row-major order.
 exist for debugging and application code, not for the hot path.
 
 `tokenize` exposes raw WordPiece ids, including `[UNK]`, and its own
-`max_tokens` cap is therefore a raw-id cap. Embedding has a different, upstream
-pooling rule: for `UNK_DROP`, `[UNK]` is removed first and `max_tokens` is then
-applied to usable ids. To cache tokenization without changing the embedding,
-cache it unbounded:
+`max_tokens` cap is therefore a raw-id cap. Embedding applies the model's
+recorded truncation policy: with `:raw_ids` (model2vec 0.10.0, the default for
+new Model2Vec conversions) the cap counts raw ids and `[UNK]` is dropped
+afterwards; with `:usable_ids` (model2vec 0.9.0) `[UNK]` is dropped first and the
+cap counts the remaining ids. To cache tokenization without changing the
+embedding, cache it unbounded:
 
 ```ruby
 ids = model.tokenize(text, max_tokens: false)
 model.embed_token_ids(ids) == model.embed(text)
 ```
 
-`embed_token_ids` applies that same usable-id cap. This distinction matters only
-when `[UNK]` appears around the truncation boundary.
+`embed_token_ids` applies the same policy. The two policies differ only when
+`[UNK]` appears before the truncation boundary.
 
 ### `format: :f16`
 
@@ -207,11 +223,11 @@ model.dot_top_k(query, MATRIX, 10)          # lock-free, concurrent, GVL release
 
 When truncation is active the runtime starts with a leading slice sized from
 `max_tokens`, cut on a word boundary, and grows the budget until it has reached
-`max_tokens` **usable** ids. For ordinary in-vocabulary text this keeps the
-tokenized prefix to a few kilobytes even when the document is megabytes long.
-For OOV-heavy input it may scan farther — or the whole string — because `[UNK]`
-no longer consumes the usable-token budget. That is required for the corrected
-UNK-before-truncate contract.
+`max_tokens` ids as counted by the model's truncation policy. For ordinary
+in-vocabulary text this keeps the tokenized prefix to a few kilobytes even when
+the document is megabytes long. Under `:usable_ids`, OOV-heavy input may scan
+farther — or the whole string — because `[UNK]` does not consume the budget;
+under `:raw_ids` it does, so the scan stays bounded.
 
 That bounds the tokenizer, not the whole call. `embed` also has to establish
 that the Ruby `String` is valid UTF-8, and when Ruby has not computed the
@@ -286,35 +302,49 @@ end
 
 ## Language safety
 
-`potion-retrieval-32M` is an English retrieval model. Russian text can produce a
-high `[UNK]` ratio while still returning a valid vector, which is the most
-likely way to end up with a silently bad index. Check the ratio before trusting
-a corpus:
+`potion-retrieval-32M` is an English retrieval model. Foreign-language text still
+returns a valid vector, which is the most likely way to end up with a silently
+bad index. It fails in two different ways, and the `[UNK]` ratio sees only one:
+
+- words the vocabulary cannot spell become `[UNK]` (high `unk_count`);
+- words it *can* spell letter by letter (English BERT-derived vocabularies
+  usually contain single Cyrillic letters) become chains of one-character
+  pieces: `[UNK]` stays near zero and the vector is still close to meaningless.
+
+Check both before trusting a corpus:
 
 ```ruby
 stats = model.embed_with_stats(text)
 ratio = stats[:token_count].zero? ? 0.0 : stats[:unk_count].to_f / stats[:token_count]
+words = text.split.size
+pieces_per_word = words.zero? ? 0.0 : stats[:token_count].to_f / words
 
 warn "high [UNK] ratio: #{ratio.round(3)}" if ratio > 0.3
+warn "text is spelled out in fragments: #{pieces_per_word.round(1)} pieces/word" if pieces_per_word > 2.5
 ```
+
+In-vocabulary English is typically 1.1–1.4 pieces per word. `text.split` is a
+rough word count (it ignores punctuation splitting), which is enough for this
+check.
 
 Out-of-vocabulary text is also slower, because every word falls through to
 subword splitting instead of hitting the vocabulary directly.
 
 ## Correctness contract
 
-0.1.5 separates contracts that 0.1.4 accidentally mixed together:
+Pinned upstream: `model2vec 0.10.0`, `tokenizers 0.23.3`.
 
-- `tokenize` matches the pinned Hugging Face `tokenizers 0.23.1` raw
+- `tokenize` matches the pinned Hugging Face `tokenizers` raw
   `BertNormalizer + BertPreTokenizer + WordPiece` ids, including the supported
   `normalized: false` standard added tokens and `[UNK]`.
-- Embedding drops `[UNK]` when the model records `UNK_DROP`, then applies
-  `max_tokens` to the remaining usable ids, mean-pools, and performs source-model
-  L2 normalization.
-- The gem intentionally does **not** reproduce Model2Vec 0.9.0's character
-  pre-cut (`max_length * median_token_length`). Here `max_tokens` means actual
-  usable tokenizer ids. The oracle reports rows affected by this difference
-  separately instead of calling them parity.
+- Embedding applies the recorded truncation policy (`:raw_ids` caps raw ids and
+  then drops `[UNK]`, as model2vec 0.10.0 does; `:usable_ids` drops `[UNK]` and
+  then caps, as 0.9.0 did), mean-pools, and performs source-model L2
+  normalization.
+- The gem intentionally does **not** reproduce Model2Vec's character pre-cut
+  (`max_length * median_token_length`, still present in 0.10.0). Here
+  `max_tokens` means actual tokenizer ids. The oracle reports rows affected by
+  this difference separately instead of calling them parity.
 
 Where the execution contracts are the same, vectors are compared to
 `model2vec.StaticModel` with:

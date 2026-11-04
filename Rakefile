@@ -44,7 +44,7 @@ task parity: :compile do
       Generate it first (needs Python and the model2vec package):
 
         python3 -m venv .venv-model2vec && . .venv-model2vec/bin/activate
-        pip install "model2vec==0.9.0" "tokenizers==0.23.1" numpy
+        pip install "model2vec==0.10.0" "tokenizers==0.23.3" "numpy==2.5.4"
         python tools/model2vec_oracle.py /path/to/source-model --out #{oracle}
     MSG
   end

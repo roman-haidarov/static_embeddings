@@ -33,13 +33,30 @@ module TestSupport
     return false if File.size(path) < StaticEmbeddings::Format::HEADER_SIZE
 
     data = File.binread(path, 16)
+    return false if File.mtime(path) < newest_converter_source_mtime
+
     data.byteslice(0, 8) == StaticEmbeddings::Format::MAGIC.b &&
       data.byteslice(8, 4).unpack1("V") == StaticEmbeddings::Format::VERSION_WORDPIECE &&
       data.byteslice(12, 4).unpack1("V") == StaticEmbeddings::Format::HEADER_SIZE
   end
 
+  def newest_converter_source_mtime
+    Dir[File.join(ROOT, "lib", "**", "*.rb")].map { |file| File.mtime(file) }.max
+  end
+
   def model
     @model ||= StaticEmbeddings.load(model_path)
+  end
+
+  USABLE_MODEL_PATH = File.join(ROOT, "tmp", "test-tiny-usable-ids.semb")
+
+  def usable_ids_model
+    @usable_ids_model ||= begin
+      FileUtils.mkdir_p(File.dirname(USABLE_MODEL_PATH))
+      StaticEmbeddings.convert(source_dir, output_path: USABLE_MODEL_PATH,
+                                           model_id: "fixture/tiny-wordpiece", truncation: :usable_ids)
+      StaticEmbeddings.load(USABLE_MODEL_PATH)
+    end
   end
 
   def reference

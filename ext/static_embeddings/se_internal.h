@@ -28,6 +28,7 @@ static inline void se_cancel_request(se_cancel_flag_t *flag) {
 #define SE_NORMALIZATION_L2            1u
 
 #define SE_TRUNCATE_USABLE_IDS_BEFORE_POOLING 2u
+#define SE_TRUNCATE_RAW_IDS_BEFORE_UNK_DROP   3u
 
 #define SE_UNK_INCLUDE 0u
 #define SE_UNK_DROP    1u
@@ -421,6 +422,12 @@ typedef struct {
 } se_token_stats_t;
 
 typedef enum { SE_TOKEN_LIMIT_RAW = 0, SE_TOKEN_LIMIT_USABLE = 1 } se_token_limit_t;
+
+static inline se_token_limit_t se_embed_limit_mode(const se_model_t *model) {
+    return model->meta.truncation_policy == SE_TRUNCATE_RAW_IDS_BEFORE_UNK_DROP
+               ? SE_TOKEN_LIMIT_RAW
+               : SE_TOKEN_LIMIT_USABLE;
+}
 
 se_status_t se_tokenize(const se_model_t *model, se_scratch_t *scratch, const uint8_t *input,
                         size_t input_len, uint32_t max_tokens, se_token_limit_t limit_mode,

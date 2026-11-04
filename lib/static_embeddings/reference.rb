@@ -25,52 +25,55 @@ module StaticEmbeddings
       @dim = meta.fetch(:dim)
     end
 
-    def self.from_source_dir(dir, max_tokens: nil, dimensions: nil)
-      from_canonical(Importers.import(dir, max_tokens: max_tokens, dimensions: dimensions))
-    end
+    class << self
+      def from_source_dir(dir, max_tokens: nil, dimensions: nil, truncation: nil)
+        from_canonical(Importers.import(dir, max_tokens: max_tokens, dimensions: dimensions, truncation: truncation))
+      end
 
-    def self.from_canonical(model)
-      dim = model.dimensions.output
-      floats = matrix_bytes(model.matrix).unpack("e*")
-      rows = model.tokens.length
-      new(
-        tokens: model.tokens,
-        matrix: Array.new(rows) { |index| floats[index * dim, dim] },
-        meta: meta_from_canonical(model)
-      )
-    end
+      def from_canonical(model)
+        dim = model.dimensions.output
+        floats = matrix_bytes(model.matrix).unpack("e*")
+        rows = model.tokens.length
+        new(
+          tokens: model.tokens,
+          matrix: Array.new(rows) { |index| floats[index * dim, dim] },
+          meta: meta_from_canonical(model)
+        )
+      end
 
-    def self.matrix_bytes(matrix)
-      return matrix unless matrix.respond_to?(:each_chunk)
+      def matrix_bytes(matrix)
+        return matrix unless matrix.respond_to?(:each_chunk)
 
-      matrix.each_chunk.each_with_object(Format.binary_string) { |chunk, packed| packed << chunk }
-    end
+        matrix.each_chunk.each_with_object(Format.binary_string) { |chunk, packed| packed << chunk }
+      end
 
-    def self.meta_from_canonical(model)
-      tokenizer = model.tokenizer
-      runtime = model.runtime
-      {
-        dim: model.dimensions.output,
-        lowercase: tokenizer.fetch(:do_lower_case),
-        strip_accents: tokenizer.fetch(:strip_accents),
-        clean_text: tokenizer.fetch(:clean_text),
-        handle_chinese_chars: tokenizer.fetch(:handle_chinese_chars),
-        max_input_chars_per_word: tokenizer.fetch(:max_input_chars_per_word),
-        unk_token: model.tokens.fetch(tokenizer.fetch(:unk_id)),
-        normalize: runtime.normalization == Format::NORMALIZATION_L2,
-        max_tokens: runtime.max_tokens,
-        unk_policy: runtime.unk_policy,
-        added_tokens: added_tokens(model)
-      }
-    end
+      def meta_from_canonical(model)
+        tokenizer = model.tokenizer
+        runtime = model.runtime
+        {
+          dim: model.dimensions.output,
+          lowercase: tokenizer.fetch(:do_lower_case),
+          strip_accents: tokenizer.fetch(:strip_accents),
+          clean_text: tokenizer.fetch(:clean_text),
+          handle_chinese_chars: tokenizer.fetch(:handle_chinese_chars),
+          max_input_chars_per_word: tokenizer.fetch(:max_input_chars_per_word),
+          unk_token: model.tokens.fetch(tokenizer.fetch(:unk_id)),
+          normalize: runtime.normalization == Format::NORMALIZATION_L2,
+          max_tokens: runtime.max_tokens,
+          unk_policy: runtime.unk_policy,
+          truncation: runtime.truncation,
+          added_tokens: added_tokens(model)
+        }
+      end
 
-    def self.added_tokens(model)
-      mask = model.tokenizer.fetch(:added_token_mask)
-      BertWordPiece::STANDARD_SPECIAL_TOKENS.each_with_object({}) do |(content, bit), tokens|
-        next if (mask & bit).zero?
+      def added_tokens(model)
+        mask = model.tokenizer.fetch(:added_token_mask)
+        BertWordPiece::STANDARD_SPECIAL_TOKENS.each_with_object({}) do |(content, bit), tokens|
+          next if (mask & bit).zero?
 
-        id = model.tokens.index(content)
-        tokens[content] = id unless id.nil?
+          id = model.tokens.index(content)
+          tokens[content] = id unless id.nil?
+        end
       end
     end
 
@@ -93,8 +96,12 @@ module StaticEmbeddings
     end
 
     def embed(text, max_tokens: @meta[:max_tokens])
-      ids = apply_unk_policy(tokenize(text, max_tokens: false))
-      ids = ids.first(max_tokens) if max_tokens && max_tokens.positive? && ids.length > max_tokens
+      if @meta.fetch(:truncation, Format::TRUNCATE_USABLE_IDS_BEFORE_POOLING) == Format::TRUNCATE_RAW_IDS_BEFORE_UNK_DROP
+        ids = apply_unk_policy(tokenize(text, max_tokens: max_tokens))
+      else
+        ids = apply_unk_policy(tokenize(text, max_tokens: false))
+        ids = ids.first(max_tokens) if max_tokens && max_tokens.positive? && ids.length > max_tokens
+      end
       return Array.new(@dim, 0.0) if ids.empty?
 
       vector = pooled(ids)

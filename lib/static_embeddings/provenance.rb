@@ -4,8 +4,9 @@ require "static_embeddings/bert_wordpiece"
 
 module StaticEmbeddings
   module Provenance
-    MODEL2VEC_VERSION = "0.9.0"
-    TOKENIZERS_VERSION = "0.23.1"
+    MODEL2VEC_VERSION = "0.10.0"
+    MODEL2VEC_USABLE_IDS_VERSION = "0.9.0"
+    TOKENIZERS_VERSION = "0.23.3"
     UNICODE_CATEGORIES_VERSION = "0.1.1"
     NOTES = "Vectors are only reference-compatible if docs/MODEL_AUDIT.md records a passing oracle run for this source revision."
 
@@ -35,6 +36,7 @@ module StaticEmbeddings
         "reference_impl" => source.oracle,
         "reference_max_tokens" => runtime.max_tokens,
         "reference_tokenizers_version" => TOKENIZERS_VERSION,
+        "truncation" => Format::TRUNCATION_POLICIES.key(runtime.truncation).to_s,
         "source_family" => source.family,
         "source_files_sha256" => source.files_sha256,
         "source_model_id" => source.model,
@@ -46,12 +48,21 @@ module StaticEmbeddings
         "vocab_size" => model.tokens.length
       }
       data["trained_mrl_dims"] = dimensions.trained if dimensions.trained
-      add_model2vec_versions(data) if source.family == "model2vec"
+      add_baked_side_tensors(data, source.baked)
+      add_model2vec_versions(data, runtime) if source.family == "model2vec"
       data
     end
 
-    def add_model2vec_versions(data)
-      data["reference_model2vec_version"] = MODEL2VEC_VERSION
+    def add_baked_side_tensors(data, baked)
+      return unless baked && (baked[:weights] || baked[:mapping_clusters])
+
+      data["baked_token_weights"] = baked[:weights]
+      data["baked_vocabulary_quantization"] = baked[:mapping_clusters] if baked[:mapping_clusters]
+    end
+
+    def add_model2vec_versions(data, runtime)
+      data["reference_model2vec_version"] =
+        runtime.truncation == Format::TRUNCATE_RAW_IDS_BEFORE_UNK_DROP ? MODEL2VEC_VERSION : MODEL2VEC_USABLE_IDS_VERSION
       data["reference_unicode_categories_version"] = UNICODE_CATEGORIES_VERSION
     end
   end
